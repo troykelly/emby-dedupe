@@ -38,7 +38,9 @@ jobs:
             type=semver,pattern={{version}}-prerelease
             type=semver,pattern={{major}}.{{minor}}-prerelease
             type=semver,pattern={{major}}-prerelease
-            
+            type=ref,event=tag
+            type=sha,enable=true
+
       - name: Build and Push Docker Pre-Release Image
         uses: docker/build-push-action@v5
         with:
