@@ -454,33 +454,6 @@ def generate_report(unique_items: list, duplicates: list) -> None:
     print(f"Duplicates ({len(duplicates)}): {json.dumps(duplicates, indent=4)}")
 
 
-def delete_items_if_doit(
-    client: httpx.Client, base_url: str, duplicate_items: list, doit: bool
-) -> None:
-    """
-    Deletes duplicate media items if the 'doit' flag is true.
-
-    Args:
-        client (httpx.Client): The httpx client configured for the Emby server communication.
-        base_url (str): Base URL of the Emby server.
-        duplicate_items (list): A list of duplicate media items to delete.
-        doit (bool): If True, actually perform the deletion.
-    """
-    if doit:
-        for item in duplicate_items:
-            item_id = item["id"]  # Assuming the item comes with the ID labeled as 'id'.
-            url = f"{base_url}/Items/{item_id}"
-            try:
-                response = make_http_request(client, "DELETE", url)
-                logger.info(f"Deleted item with ID {item_id}")
-            except (httpx.HTTPStatusError, httpx.RequestError):
-                logger.error(f"Failed to delete item with ID {item_id}")
-    else:
-        logger.info(
-            "Deletion skipped. Items to be deleted are only listed in the report."
-        )
-
-
 def get_library_id(
     client: httpx.Client, base_url: str, library_name: str
 ) -> Optional[str]:
@@ -833,9 +806,7 @@ def format_individual_item(item, base_url, decision):
         EMOJI_CHECK if item["name"] == decision["keep"]["name"] else EMOJI_CROSS
     )
     item_link = f"[{item['id']}]({base_url}/web/index.html#!/item?id={item['id']}&serverId={decision['keep']['serverid']})"
-    deletion_status = next(
-        (d for d in decision["deleted"] if d["id"] == item["id"]), {}
-    )
+    deletion_status = item["deletion_result"]
     status_emoji = get_emoji_for_status(deletion_status.get("status", "skipped"))
     error_message = deletion_status.get("error", "")
     return (
@@ -947,13 +918,9 @@ def process_deletion_and_generate_report(
 
     # Process deletions and update decisions with deletion results
     for decision in decisions:
-        delete_results = []
         for item in decision["delete"]:
-            deletion_result = delete_item(client, base_url, item["id"], doit)
-            delete_results.append(deletion_result)
+            item["deletion_result"] = delete_item(client, base_url, item["id"], doit)
             deletion_progress_bar.update(1)  # Update progress bar after each deletion
-        # Update the decision object with deletion results
-        decision["deleted"] = delete_results
 
     # Close progress bar after deletion process is complete
     deletion_progress_bar.close()
@@ -1048,6 +1015,9 @@ def main():
         markdown_report = process_deletion_and_generate_report(
             client, base_url, decisions, doit
         )
+
+        # Dump deletion results to file
+        dump_object_to_file(decisions, "testing/deletions")
 
         dump_object_to_file(markdown_report, "testing/report")
 
