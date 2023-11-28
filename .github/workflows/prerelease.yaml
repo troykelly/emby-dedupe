@@ -1,16 +1,16 @@
-name: Build and Push Multi-Arch Docker Image on Release
+name: Build and Push Pre-Release Multi-Arch Docker Image
 
 on:
   release:
-    types: [published]
+    types: [prereleased]
 
-# Ensures that only the latest release workflow is running
+# Ensures that only the latest prerelease workflow is running
 concurrency:
-  group: release-workflow
+  group: prereleased-workflow
   cancel-in-progress: true
 
 jobs:
-  build-and-publish:
+  pre-release-build-and-publish:
     runs-on: ubuntu-latest
     steps:
       - name: Check Out Repo
@@ -29,19 +29,17 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract metadata for pre-release
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/troykelly/emby-dedupe
           tags: |
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=latest
-      
-      - name: Build and Push Docker Image
+            type=semver,pattern={{version}}-prerelease
+            type=semver,pattern={{major}}.{{minor}}-prerelease
+            type=semver,pattern={{major}}-prerelease
+            
+      - name: Build and Push Docker Pre-Release Image
         uses: docker/build-push-action@v5
         with:
           context: .
