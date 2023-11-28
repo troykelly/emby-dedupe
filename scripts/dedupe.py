@@ -444,23 +444,23 @@ def delete_items_if_doit(
         )
 
 
-def get_library_id(base_url: str, api_key: str, library_name: str) -> Optional[str]:
+def get_library_id(
+    client: httpx.Client, base_url: str, library_name: str
+) -> Optional[str]:
     """
-    Retrieves the ID of the specified library by name.
+    Retrieves the ID of the specified library by name using a provided HTTP session.
 
     Args:
+        client (httpx.Client): The httpx client configured for the Emby server communication.
         base_url (str): Base URL of the Emby server.
-        api_key (str): API key for the Emby server.
         library_name (str): The name of the library to retrieve the ID for.
 
     Returns:
         Optional[str]: The ID of the library if found, else None.
     """
-    headers = {"X-Emby-Token": api_key}
     url = f"{base_url}/Library/VirtualFolders"
     try:
-        response = httpx.get(url, headers=headers)
-        response.raise_for_status()  # Raises an HTTPError for bad responses.
+        response = make_http_request(client, "GET", url)
         virtual_folders = response.json()
 
         for folder in virtual_folders:
@@ -525,29 +525,33 @@ def dump_object_to_file(obj: Any, base_filename: str) -> None:
     raise ValueError("Object type is not supported for dumping to a file.")
 
 
-def determine_items_to_delete(base_url: str, api_key: str, duplicate_ids: list) -> dict:
+def determine_items_to_delete(
+    client: httpx.Client, base_url: str, duplicate_ids: list
+) -> dict:
     """
     Determines the best quality media item to keep and marks the rest for deletion.
     The criteria for the best quality is based on resolution, codec preference, interlacing,
     bitrate, bit depth, and file size.
 
     Args:
+        client (httpx.Client): The httpx client configured for the Emby server communication.
         base_url (str): Base URL of the Emby server.
-        api_key (str): API key for the Emby server.
         duplicate_ids (list): A list of IDs of potentially duplicate media items.
 
     Returns:
         dict: A dictionary containing details of the item to keep and the ones to delete.
     """
-    headers = {"X-Emby-Token": api_key}
     items = []
 
     # Fetch detailed item information
     for item_id in duplicate_ids:
         url = f"{base_url}/Items/{item_id}?Fields=MediaStreams,Path"
-        response = httpx.get(url, headers=headers)
-        response.raise_for_status()
-        items.append(response.json())
+        try:
+            response = make_http_request(client, "GET", url)
+            items.append(response.json())
+        except (httpx.HTTPStatusError, httpx.RequestError):
+            logging.error(f"Error fetching details for item with ID {item_id}")
+            continue  # Skip this item and log the error but continue processing
 
     # Sort items by quality based on provided criteria
     items.sort(
@@ -566,7 +570,7 @@ def determine_items_to_delete(base_url: str, api_key: str, duplicate_ids: list) 
             # Codec preference (HEVC > h264)
             -1
             if any(
-                stream.get("Codec") == "hevc"
+                stream.get("Codec") in ["hevc", "h265"]
                 for stream in i["MediaStreams"]
                 if stream["Type"] == "Video"
             )
@@ -592,8 +596,13 @@ def determine_items_to_delete(base_url: str, api_key: str, duplicate_ids: list) 
     )
 
     # The first item is the best quality; the rest are duplicates
-    best_item = items[0]
-    duplicate_items = items[1:]
+    best_item = items[0] if items else None
+    duplicate_items = items[1:] if items else []
+
+    if not best_item:
+        raise ValueError(
+            "No best item could be determined from the provided duplicate IDs."
+        )
 
     return {
         "keep": {
