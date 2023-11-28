@@ -13,6 +13,7 @@ import os
 from typing import Any
 import backoff
 import hashlib
+import errno
 from httpx import HTTPStatusError, ReadTimeout, RequestError
 
 # At the top of your script, after the imports, establish a logger for the tool
@@ -564,19 +565,6 @@ def identify_duplicates(provider_tables: dict) -> dict:
     return duplicates
 
 
-def generate_report(unique_items: list, duplicates: list) -> None:
-    """
-    Generates a report of duplicates and unique items.
-
-    Args:
-        unique_items (list): A list of media items considered as unique.
-        duplicates (list): A list of duplicate media items.
-    """
-    # Placeholder: Generate a report. You might want to write this to a file or print it.
-    print(f"Unique Items ({len(unique_items)}): {json.dumps(unique_items, indent=4)}")
-    print(f"Duplicates ({len(duplicates)}): {json.dumps(duplicates, indent=4)}")
-
-
 def get_library_id(
     client: httpx.Client, base_url: str, library_name: str
 ) -> Optional[str]:
@@ -627,10 +615,19 @@ def dump_object_to_file(obj: Any, base_filename: str) -> None:
     Raises:
         ValueError: If the object type cannot be determined or handled by the function.
     """
-    # Paths for different file types
-    json_path = f"{base_filename}.json"
-    text_path = f"{base_filename}.txt"
-    bin_path = f"{base_filename}.bin"
+    # Ensure that the 'dump' subdirectory exists
+    directory = os.path.join("dump")
+    if not os.path.exists(directory):
+        try:
+            os.makedirs(directory)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+
+    # Construct full file paths with appropriate extension
+    json_path = os.path.join(directory, f"{base_filename}.json")
+    text_path = os.path.join(directory, f"{base_filename}.txt")
+    bin_path = os.path.join(directory, f"{base_filename}.bin")
 
     # Check if the object is serializable to JSON (dict or list)
     if isinstance(obj, (dict, list)):
