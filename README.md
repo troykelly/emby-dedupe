@@ -13,13 +13,13 @@ The Emby Deduplication Script Docker container assists in managing media librari
 
 The following architectures are supported in the latest version:
 
-| Architecture    | Supported          | Build Status  |
-|-----------------|--------------------|---------------|
-| `amd64`         | :white_check_mark: | ![amd64 Status](#) |
-| `arm64`         | :white_check_mark: | ![arm64 Status](#) |
-| `arm/v7`        | :white_check_mark: | ![armv7 Status](#) |
-| `arm/v6`        | :white_check_mark: | ![armv6 Status](#) |
-| `i386`          | :x:                | ![i386 Status](#)  |
+| Architecture    | Supported          |
+|-----------------|--------------------|
+| `amd64`         | :white_check_mark: |
+| `arm64`         | :white_check_mark: |
+| `arm/v7`        | :white_check_mark: |
+| `arm/v6`        | :white_check_mark: |
+| `i386`          | :x:                |
 
 ## Table of Contents
 
