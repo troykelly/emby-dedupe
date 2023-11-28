@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
 
+# Ensures that only the latest release workflow is running
+concurrency:
+  group: release-workflow
+  cancel-in-progress: true
+
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
