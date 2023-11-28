@@ -900,11 +900,11 @@ def delete_item(client: httpx.Client, base_url: str, item_id: str, doit: bool) -
     if doit:
         url = f"{base_url}/Items/{item_id}"
         try:
-            response = client.delete(url)
+            # Use the global HTTP_TIMEOUT constant
+            response = make_http_request(client, "DELETE", url, timeout=HTTP_TIMEOUT)
             if response.is_success:
                 deletion_status["status"] = "success"
             else:
-                # If the response was not successful, log the status code and content for debugging
                 deletion_status.update(
                     {
                         "status": "failed",
@@ -916,7 +916,6 @@ def delete_item(client: httpx.Client, base_url: str, item_id: str, doit: bool) -
                     f"{url} [{response.status_code}] Response: {response.text}"
                 )
         except Exception as e:
-            # Set the error message in the deletion status and log it for debugging
             deletion_status.update({"status": "failed", "error": str(e)})
             logger.error(f"Exception occurred during deletion of item {item_id}: {e}")
     else:
