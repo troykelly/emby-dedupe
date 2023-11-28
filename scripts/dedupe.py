@@ -6,12 +6,16 @@ import logging
 import argparse
 import httpx
 from httpx import URL
+from tqdm import tqdm
 from typing import Optional, Tuple
 import json
 import os
 from typing import Any
 import backoff
 
+# At the top of your script, after the imports, establish a logger for the tool
+logger = logging.getLogger("EmbyDedupe")
+logger.setLevel(logging.ERROR)  # Default log level for the tool's logger
 
 MAX_RETRIES = 5  # The maximum number of retries for HTTP requests
 
@@ -123,13 +127,29 @@ def set_logging_level(verbosity_count: int, env_verbosity: Optional[str]) -> Non
         env_verbosity (Optional[str]): Verbosity level from the environment variable.
     """
     # Determine the logging level
-    levels = ["", "WARNING", "INFO", "DEBUG"]
-    level_name = env_verbosity or ""
+    levels = ["ERROR", "WARNING", "INFO", "DEBUG"]
+    level_name = env_verbosity or "ERROR"
     if verbosity_count:
         level_name = levels[min(verbosity_count, len(levels) - 1)]
     level = LOGGING_LEVELS.get(level_name, logging.ERROR)
-    logging.basicConfig(level=level)
-    logging.info(f"Logging level set to {logging.getLevelName(level)}")
+
+    # Set the level for the tool's logger instead of the root logger
+    logger.setLevel(level)
+
+    # Configure a console handler for the tool's logger
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # To avoid duplicate logging if function is called multiple times, clear any previously added handlers
+    logger.handlers.clear()
+    logger.addHandler(console_handler)
+
+    logger.info(f"Logging level set to {logging.getLevelName(level)}")
 
 
 def override_warning(arg_name: str, cmd_val: str, env_val: str) -> None:
@@ -141,7 +161,7 @@ def override_warning(arg_name: str, cmd_val: str, env_val: str) -> None:
         env_val (str): The value from the environment variable.
     """
     if cmd_val and env_val:
-        logging.warning(
+        logger.warning(
             f"Warning: The command-line argument {arg_name} ('{cmd_val}') "
             f"overrides the environment variable ('{env_val}')."
         )
@@ -211,7 +231,7 @@ def handle_host_and_port(host: str, arg_port: Optional[int]) -> Tuple[str, int]:
 
     # Use the port from arguments if it was explicitly provided and differs from the URL port.
     if arg_port is not None and final_port != arg_port:
-        logging.warning(
+        logger.warning(
             f"The port number from the URL '{final_port}' is overridden by the command-line argument port '{arg_port}'."
         )
         final_port = arg_port
@@ -238,12 +258,12 @@ def check_emby_connection(client: httpx.Client, url: str) -> bool:
     Raises:
         EmbyServerConnectionError: If there's an issue with connecting to the Emby server.
     """
-    logging.debug(f"Checking connection to Emby server at {url}")
+    logger.debug(f"Checking connection to Emby server at {url}")
     try:
         response = make_http_request(client, "GET", url)
         # If the request was successful, we don't need to check response status
         # since 'make_http_request' already calls 'raise_for_status()'.
-        logging.info("Successfully connected to the Emby server.")
+        logger.info("Successfully connected to the Emby server.")
         return True
     except httpx.HTTPStatusError as e:
         raise EmbyServerConnectionError(
@@ -310,7 +330,7 @@ def fetch_and_process_media_items(
         response = make_http_request(client, "GET", url)
         total_items = response.json().get("TotalRecordCount", 0)
     except (httpx.HTTPStatusError, httpx.RequestError):
-        logging.error("Failed to fetch the total number of media items.")
+        logger.error("Failed to fetch the total number of media items.")
         return provider_tables  # Return current tables which may be empty
 
     while start_index < total_items:
@@ -320,9 +340,9 @@ def fetch_and_process_media_items(
             media_items = response.json().get("Items", [])
             build_provider_id_tables(media_items, provider_tables)
             start_index += page_size
-            logging.info(f"Processed {start_index}/{total_items} items.")
+            logger.info(f"Processed {start_index}/{total_items} items.")
         except (httpx.HTTPStatusError, httpx.RequestError):
-            logging.error(
+            logger.error(
                 f"Error fetching page of media items starting at index {start_index}"
             )
             # Optionally, break or return here if we should stop processing on error
@@ -379,11 +399,11 @@ def delete_items_if_doit(
             url = f"{base_url}/Items/{item_id}"
             try:
                 response = make_http_request(client, "DELETE", url)
-                logging.info(f"Deleted item with ID {item_id}")
+                logger.info(f"Deleted item with ID {item_id}")
             except (httpx.HTTPStatusError, httpx.RequestError):
-                logging.error(f"Failed to delete item with ID {item_id}")
+                logger.error(f"Failed to delete item with ID {item_id}")
     else:
-        logging.info(
+        logger.info(
             "Deletion skipped. Items to be deleted are only listed in the report."
         )
 
@@ -411,15 +431,15 @@ def get_library_id(
             if folder.get("Name") == library_name:
                 return folder.get("Id")
 
-        logging.error(f"Library '{library_name}' not found.")
+        logger.error(f"Library '{library_name}' not found.")
         return None  # Return None if library is not found
 
     except httpx.HTTPStatusError as e:
-        logging.error(
+        logger.error(
             f"HTTP error occurred while retrieving library ID: {e.response.content}"
         )
     except httpx.RequestError as e:
-        logging.error(f"HTTP request to Emby server failed: {str(e)}")
+        logger.error(f"HTTP request to Emby server failed: {str(e)}")
 
     return None  # Return None if any exception occurred
 
@@ -494,7 +514,7 @@ def determine_items_to_delete(
             response = make_http_request(client, "GET", url)
             items.append(response.json())
         except (httpx.HTTPStatusError, httpx.RequestError):
-            logging.error(f"Error fetching details for item with ID {item_id}")
+            logger.error(f"Error fetching details for item with ID {item_id}")
             continue  # Skip this item and log the error but continue processing
 
     # Sort items by quality based on provided criteria
@@ -634,8 +654,10 @@ def merge_duplicate_groups(duplicates_by_provider: dict) -> list:
 
         duplicate_groups = remaining_groups
 
-    # Iterate over each provider and merge their duplicates into the groups
-    for provider_duplicates in duplicates_by_provider.values():
+    # Iterate over each provider and merge their duplicates into the groups with progress bar
+    for provider, provider_duplicates in tqdm(
+        duplicates_by_provider.items(), desc="Merging duplicate groups"
+    ):
         for dup_ids in provider_duplicates.values():
             merge_into_groups(dup_ids)
 
@@ -668,7 +690,7 @@ def main():
     override_warning("--library", args.library, env_library)
 
     # Final values with command-line arguments taking precedence over environment variables
-    logging.debug("Collecting final values for required settings")
+    logger.debug("Collecting final values for required settings")
     host = args.host or env_host
     port = args.port or env_port or None
     api_key = args.api_key or env_api_key
@@ -681,7 +703,7 @@ def main():
     # Validate and handle host and port information
     validated_host, validated_port = handle_host_and_port(host, port)
 
-    logging.debug(
+    logger.debug(
         f"Using the following configurations: "
         f"Host: {validated_host}, Port: {validated_port}, API Key: {api_key}, "
         f"Library: {library}, DoIt: {doit}"
@@ -696,12 +718,12 @@ def main():
         # Check connection to Emby server
         connection_url = f"{base_url}/System/Info"
         if not check_emby_connection(client, connection_url):
-            logging.error(f"Unable to connect to the Emby server at {base_url}.")
+            logger.error(f"Unable to connect to the Emby server at {base_url}.")
             sys.exit(1)
 
         library_id = get_library_id(client, base_url, library)
         if library_id is None:
-            logging.error(f"Unable to find library '{library}'.")
+            logger.error(f"Unable to find library '{library}'.")
             sys.exit(1)
 
         # Fetch media items and process them to identify duplicates
@@ -722,7 +744,7 @@ def main():
         dump_object_to_file(duplicates, "testing/aggregate")
 
     except EmbyServerConnectionError as e:
-        logging.error(str(e))
+        logger.error(str(e))
         sys.exit(1)
 
 
