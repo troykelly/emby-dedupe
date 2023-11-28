@@ -1,3 +1,6 @@
+# Application Specific
+testing/**
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -164,7 +167,8 @@ cython_debug/
 .LSOverride
 
 # Icon must end with two \r
-Icon
+Icon
+
 
 # Thumbnails
 ._*
