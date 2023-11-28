@@ -1,4 +1,4 @@
-name: Build and Push Pre-Release Multi-Arch Docker Image
+name: Pre-Relase Container Build
 
 on:
   release:

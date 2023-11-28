@@ -1,4 +1,4 @@
-name: Build and Push Multi-Arch Docker Image on Release
+name: Relase Container Build
 
 on:
   release:
