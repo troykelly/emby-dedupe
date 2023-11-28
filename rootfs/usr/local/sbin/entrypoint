@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# Exit on error
+set -e
+
+# If no arguments provided, then run the script with defaults.
+if [ $# -eq 0 ]; then
+    exec python ./dedupe.py
+
+# If the first argument starts with "-", pass all arguments to the script.
+elif [[ $1 == -* ]]; then
+    exec python ./dedupe.py "$@"
+
+# Otherwise, assume user wants to run their own command.
+else
+    exec "$@"
+fi

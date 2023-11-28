@@ -111,7 +111,7 @@ def make_http_request(
         response.raise_for_status()
         return response
     except (HTTPStatusError, ReadTimeout, RequestError) as exc:
-        logger.warn(f"Request failed: {exc}. Retrying...")
+        logger.warning(f"Request failed: {exc}. Retrying...")
         raise
 
 
