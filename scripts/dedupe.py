@@ -846,6 +846,7 @@ def format_individual_item(item, base_url, decision):
 def format_markdown_table(base_url: str, decisions: list) -> str:
     """
     Formats the decisions into a markdown table.
+    This function includes a progress bar reporting for each group of duplicates as it's being formatted.
 
     Args:
         base_url (str): The base URL of the Emby server.
@@ -855,14 +856,11 @@ def format_markdown_table(base_url: str, decisions: list) -> str:
         str: A formatted markdown table as a string.
     """
 
-    def get_deletion_status_emoji(status):
-        return EMOJI_CHECK if status == "success" else EMOJI_CROSS
-
     # Headers
     headers = ["ID", "Title", "Codec", "Size", "Items to Delete"]
     max_widths = {header: len(header) for header in headers}
 
-    # Determine the maximum width for each column
+    # Determine the maximum width for each column based on content
     for decision in decisions:
         keep = decision["keep"]
         max_widths["ID"] = max(max_widths["ID"], len(keep["id"]))
@@ -893,6 +891,12 @@ def format_markdown_table(base_url: str, decisions: list) -> str:
 
     # Rows
     rows = []
+
+    # Initialize progress bar for markdown table formatting process
+    table_progress_bar = tqdm(
+        total=len(decisions), desc="Formatting markdown table", unit="group"
+    )
+
     for decision in decisions:
         keep = decision["keep"]
         id_link = f"[{keep['id']}]({base_url}/web/index.html#!/item?id={keep['id']}&serverId={decision['keep']['serverid']})"
@@ -911,6 +915,9 @@ def format_markdown_table(base_url: str, decisions: list) -> str:
             f"| {delete_entries:<{max_widths['Items to Delete']}} |\n"
         )
         rows.append(row)
+        table_progress_bar.update(1)
+
+    table_progress_bar.close()
 
     markdown_table = header_line + separator_line + "".join(rows)
     return markdown_table
@@ -921,6 +928,7 @@ def process_deletion_and_generate_report(
 ) -> str:
     """
     Processes deletions based on the decisions and generates a markdown report.
+    This function includes a progress bar reporting for deletions.
 
     Args:
         client (httpx.Client): The httpx client configured for the Emby server communication.
@@ -931,18 +939,27 @@ def process_deletion_and_generate_report(
     Returns:
         str: The generated markdown report.
     """
+    # Initialize progress bar for deletion process
+    total_deletions = sum(len(decision["delete"]) for decision in decisions)
+    deletion_progress_bar = tqdm(
+        total=total_deletions, desc="Deleting duplicate items", unit="item"
+    )
+
     # Process deletions and update decisions with deletion results
     for decision in decisions:
         delete_results = []
         for item in decision["delete"]:
             deletion_result = delete_item(client, base_url, item["id"], doit)
             delete_results.append(deletion_result)
+            deletion_progress_bar.update(1)  # Update progress bar after each deletion
         # Update the decision object with deletion results
         decision["deleted"] = delete_results
 
-    # Generate report in markdown format
-    report = format_markdown_table(base_url, decisions)
-    return report
+    # Close progress bar after deletion process is complete
+    deletion_progress_bar.close()
+
+    # Generate and return the report in markdown format
+    return format_markdown_table(base_url, decisions)
 
 
 def main():
