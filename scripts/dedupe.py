@@ -1137,29 +1137,29 @@ def main():
             logger.error(f"Unable to find library '{library}'.")
             sys.exit(1)
 
-        # # Fetch media items and process them to identify duplicates
-        # provider_tables = fetch_and_process_media_items(client, base_url, library_id)
+        # Fetch media items and process them to identify duplicates
+        provider_tables = fetch_and_process_media_items(client, base_url, library_id)
 
-        # # Dump provider tables to files
-        # dump_object_to_file(provider_tables, "testing/provider_tables")
+        # Dump provider tables to files
+        dump_object_to_file(provider_tables, "testing/provider_tables")
 
-        # # Identify duplicates
-        # duplicates = identify_duplicates(provider_tables)
+        # Identify duplicates
+        duplicates = identify_duplicates(provider_tables)
 
-        # dump_object_to_file(duplicates, "testing/duplicates")
+        dump_object_to_file(duplicates, "testing/duplicates")
 
-        # # Aggregate duplicates
-        # duplicates = rationalize_duplicates(duplicates)
+        # Aggregate duplicates
+        duplicates = rationalize_duplicates(duplicates)
 
-        # # Dump duplicates to files
-        # dump_object_to_file(duplicates, "testing/aggregate")
+        # Dump duplicates to files
+        dump_object_to_file(duplicates, "testing/aggregate")
 
-        # decisions = process_duplicate_groups(client, base_url, duplicates)
+        decisions = process_duplicate_groups(client, base_url, duplicates)
 
-        # # Dump decisions to files
-        # dump_object_to_file(decisions, "testing/decisions")
+        # Dump decisions to files
+        dump_object_to_file(decisions, "testing/decisions")
 
-        decisions = read_json_file("testing/decisions.json")
+        # decisions = read_json_file("testing/decisions.json")
 
         markdown_report = process_deletion_and_generate_report(
             client, base_url, decisions, doit
