@@ -1,0 +1,71 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/python
+{
+    "name": "Python 3",
+    // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+    "image": "mcr.microsoft.com/devcontainers/python:0-3.11",
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "installZsh": true,
+            "configureZshAsDefaultShell": true,
+            "installOhMyZsh": true,
+            "upgradePackages": true,
+            "nonFreePackages": true,
+            "username": "vscode",
+            "userUid": "1000",
+            "userGid": "1000"
+        },
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {
+            "moby": true,
+            "azureDnsAutoDetection": true,
+            "installDockerBuildx": true,
+            "version": "latest",
+            "dockerDashComposeVersion": "v2"
+        },
+        "ghcr.io/devcontainers/features/github-cli:1": {
+            "installDirectlyFromGitHubRelease": true,
+            "version": "latest"
+        },
+        "ghcr.io/devcontainers-contrib/features/yamllint:2": {
+            "version": "latest"
+        },
+        "ghcr.io/stuartleeks/dev-container-features/shell-history:0": {},
+        "ghcr.io/flexwie/devcontainer-features/op:1": {}
+    },
+    "remoteEnv": {
+        "PATH": "${containerEnv:PATH}:/home/vscode/.local/bin"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "redhat.vscode-yaml",
+                "ZainChen.json",
+                "GitHub.vscode-pull-request-github",
+                "GitHub.github-vscode-theme",
+                "GitHub.copilot",
+                "GitHub.remotehub",
+                "bierner.markdown-preview-github-styles",
+                "GitHub.copilot-labs",
+                "GitHub.vscode-github-actions",
+                "DanielSanMedium.dscodegpt",
+                "KevinRose.vsc-python-indent",
+                "ms-python.black-formatter"
+            ]
+        }
+    },
+    // Features to add to the dev container. More info: https://containers.dev/features.
+    // "features": {},
+    // Use 'forwardPorts' to make a list of ports inside the container available locally.
+    // "forwardPorts": [],
+    "runArgs": [
+        "--env-file",
+        ".env"
+    ],
+    // Use 'postCreateCommand' to run commands after the container is created.
+    "postCreateCommand": "git config --global --add safe.directory /workspaces/emby-dedupe && sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade && sudo DEBIAN_FRONTEND=noninteractive apt-get -y install dnsutils bind9utils moreutils whois && wget https://github.com/mikefarah/yq/releases/download/v4.33.3/yq_linux_amd64.tar.gz -O - | tar xz && sudo mv yq_linux_amd64 /usr/bin/yq && sudo rm yq.1 || true && pip install --upgrade pip && pip install -r requirements.txt"
+    // Configure tool-specific properties.
+    // "customizations": {},
+    // Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+    // "remoteUser": "root"
+}
