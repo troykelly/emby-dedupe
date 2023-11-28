@@ -13,6 +13,7 @@ import os
 from typing import Any
 import backoff
 import hashlib
+import errno
 from httpx import HTTPStatusError, ReadTimeout, RequestError
 
 # At the top of your script, after the imports, establish a logger for the tool
@@ -564,19 +565,6 @@ def identify_duplicates(provider_tables: dict) -> dict:
     return duplicates
 
 
-def generate_report(unique_items: list, duplicates: list) -> None:
-    """
-    Generates a report of duplicates and unique items.
-
-    Args:
-        unique_items (list): A list of media items considered as unique.
-        duplicates (list): A list of duplicate media items.
-    """
-    # Placeholder: Generate a report. You might want to write this to a file or print it.
-    print(f"Unique Items ({len(unique_items)}): {json.dumps(unique_items, indent=4)}")
-    print(f"Duplicates ({len(duplicates)}): {json.dumps(duplicates, indent=4)}")
-
-
 def get_library_id(
     client: httpx.Client, base_url: str, library_name: str
 ) -> Optional[str]:
@@ -627,10 +615,19 @@ def dump_object_to_file(obj: Any, base_filename: str) -> None:
     Raises:
         ValueError: If the object type cannot be determined or handled by the function.
     """
-    # Paths for different file types
-    json_path = f"{base_filename}.json"
-    text_path = f"{base_filename}.txt"
-    bin_path = f"{base_filename}.bin"
+    # Ensure that the 'dump' subdirectory exists
+    directory = os.path.join("dump")
+    if not os.path.exists(directory):
+        try:
+            os.makedirs(directory)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+
+    # Construct full file paths with appropriate extension
+    json_path = os.path.join(directory, f"{base_filename}.json")
+    text_path = os.path.join(directory, f"{base_filename}.txt")
+    bin_path = os.path.join(directory, f"{base_filename}.bin")
 
     # Check if the object is serializable to JSON (dict or list)
     if isinstance(obj, (dict, list)):
@@ -1067,6 +1064,23 @@ def process_deletion_and_generate_report(
     return format_markdown_table(base_url, decisions)
 
 
+def output_report_to_stdout(report_content: str) -> None:
+    """
+    Outputs a markdown report to stdout. This output can be captured by CI/CD systems.
+
+    Args:
+        report_content (str): The report data in markdown format.
+    """
+    # Unique delimiters for the report data –– make sure these don't appear in the report content
+    start_delimiter = "EMBY_DEDUPE_REPORT_START"
+    end_delimiter = "EMBY_DEDUPE_REPORT_END"
+
+    # Output the report data as markdown to stdout between delimiters
+    print(start_delimiter)
+    print(report_content)
+    print(end_delimiter)
+
+
 def main():
     # The 'cmd_args' dictionary will store the command line arguments
     args = parse_args()
@@ -1141,23 +1155,31 @@ def main():
         provider_tables = fetch_and_process_media_items(client, base_url, library_id)
 
         # Dump provider tables to files
-        dump_object_to_file(provider_tables, "testing/provider_tables")
+        dump_object_to_file(
+            provider_tables, "testing/provider_tables"
+        ) if logger.isEnabledFor(logging.DEBUG) else None
 
         # Identify duplicates
         duplicates = identify_duplicates(provider_tables)
 
-        dump_object_to_file(duplicates, "testing/duplicates")
+        dump_object_to_file(duplicates, "testing/duplicates") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
 
         # Aggregate duplicates
         duplicates = rationalize_duplicates(duplicates)
 
         # Dump duplicates to files
-        dump_object_to_file(duplicates, "testing/aggregate")
+        dump_object_to_file(duplicates, "testing/aggregate") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
 
         decisions = process_duplicate_groups(client, base_url, duplicates)
 
         # Dump decisions to files
-        dump_object_to_file(decisions, "testing/decisions")
+        dump_object_to_file(decisions, "testing/decisions") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
 
         # decisions = read_json_file("testing/decisions.json")
 
@@ -1166,9 +1188,15 @@ def main():
         )
 
         # Dump deletion results to file
-        dump_object_to_file(decisions, "testing/deletions")
+        dump_object_to_file(decisions, "testing/deletions") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
 
-        dump_object_to_file(markdown_report, "testing/report")
+        dump_object_to_file(markdown_report, "testing/report") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
+
+        output_report_to_stdout(markdown_report)
 
     except EmbyServerConnectionError as e:
         logger.error(str(e))
