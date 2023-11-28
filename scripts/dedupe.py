@@ -36,10 +36,15 @@ LOGGING_LEVELS = {
 
 
 @backoff.on_exception(
-    backoff.expo,  # Exponential backoff strategy
-    httpx.HTTPError,  # Retry on HTTP error responses
-    max_time=60,  # Maximum total time to backoff for
-    max_tries=MAX_RETRIES,  # Maximum number of retries per call
+    backoff.expo,
+    httpx.HTTPStatusError,  # Retry on HTTP error responses (4xx and 5xx status codes)
+    max_time=60,  # Maximum total backoff time
+    giveup=lambda e: e.response.status_code < 500,  # Don't retry for client errors
+)
+@backoff.on_exception(
+    backoff.expo,
+    httpx.RequestError,  # Retry on request errors like network issues
+    max_time=60,  # Maximum total backoff time
 )
 def make_http_request(
     client: httpx.Client, method: str, url: str, **kwargs
@@ -55,22 +60,19 @@ def make_http_request(
 
     Returns:
         httpx.Response: The HTTP response from the server.
+
+    Raises:
+        httpx.HTTPStatusError: If the HTTP request returned an unsuccessful status code.
+        httpx.RequestError: If the request transmission failed.
     """
-    try:
-        response = client.request(method, url, **kwargs)
-        response.raise_for_status()  # Will raise an error for 4xx and 5xx responses
-        return response
-    except httpx.HTTPStatusError as e:
-        logging.error(f"HTTP error occurred: {e.response.content}")
-        raise
-    except httpx.RequestError as e:
-        logging.error(f"Request error occurred: {str(e)}")
-        raise
+    response = client.request(method, url, **kwargs)
+    response.raise_for_status()
+    return response
 
 
 def create_http_client(api_key: str) -> httpx.Client:
     """
-    Create an httpx.Client instance configured with retry logic and API key headers.
+    Create an httpx.Client instance with API key headers.
 
     Args:
         api_key (str): The API key for the Emby server.
@@ -79,13 +81,7 @@ def create_http_client(api_key: str) -> httpx.Client:
         httpx.Client: A client instance configured for communication with Emby server.
     """
     headers = {"X-Emby-Token": api_key}
-    retries = httpx.Retry(
-        max_retries=MAX_RETRIES,
-        backoff_factor=1,  # Exponential backoff factor
-        status_forcelist=(500, 502, 503, 504),  # Retry on these status codes
-        http_methods={"GET", "DELETE"},
-    )
-    client = httpx.Client(headers=headers, retries=retries)
+    client = httpx.Client(headers=headers)
     return client
 
 
@@ -259,47 +255,6 @@ def check_emby_connection(client: httpx.Client, url: str) -> bool:
         )
 
 
-def validate_library(base_url: str, api_key: str, library_name: str) -> bool:
-    """
-    Confirm that the specified library exists and it has at least one item.
-
-    Args:
-        base_url (str): Base URL of the Emby server.
-        api_key (str): API key for the Emby server.
-        library_name (str): The name of the library to be validated.
-
-    Returns:
-        bool: True if the library exists and contains items, False otherwise.
-
-    Raises:
-        EmbyServerConnectionError: If there's an issue with connecting to the Emby server.
-    """
-    headers = {"X-Emby-Token": api_key}
-    response = httpx.get(f"{base_url}/Library/VirtualFolders", headers=headers)
-
-    try:
-        response.raise_for_status()  # Raises an HTTPError if the HTTP request returned an unsuccessful status code
-        virtual_folders = response.json()
-
-        for folder in virtual_folders:
-            if library_name == folder.get("Name"):
-                # Here we could add additional checks for folder content if needed
-                logging.info(f"Library '{library_name}' validated successfully.")
-                return True
-
-        logging.error(f"Library '{library_name}' is not found.")
-        return False
-
-    except httpx.HTTPStatusError as e:
-        raise EmbyServerConnectionError(
-            f"Failed to validate library: {e.response.content}"
-        )
-    except httpx.RequestError as e:
-        raise EmbyServerConnectionError(
-            f"An error occurred while checking the library: {str(e)}"
-        )
-
-
 def build_provider_id_tables(media_items: list, provider_tables: dict):
     """
     Builds tables that map provider IDs (Imdb, Tvdb, Tmdb) to lists of media item IDs,
@@ -331,15 +286,15 @@ def build_provider_id_tables(media_items: list, provider_tables: dict):
 
 
 def fetch_and_process_media_items(
-    base_url: str, api_key: str, library_id: str
+    client: httpx.Client, base_url: str, library_id: str
 ) -> Tuple[dict, dict, dict]:
     """
-    Fetches media items in an efficient paginated manner and builds the provider ID tables.
+    Fetches media items in a paginated manner and builds the provider ID tables.
 
     Args:
+        client (httpx.Client): The httpx client configured for the Emby server communication.
         base_url (str): Base URL of the Emby server.
-        api_key (str): API key for the Emby server.
-        library_id (str): The ID of the library/virtual folder from which to fetch media items.
+        library_id (str): The ID of the library/virtual folder to fetch media items from.
 
     Returns:
         Tuple[dict, dict, dict]: Three dictionaries (imdb, tvdb, tmdb) containing provider ID mappings.
@@ -347,29 +302,30 @@ def fetch_and_process_media_items(
     page_size = 100  # Efficient page size to minimize memory consumption
     start_index = 0  # Starting index for pagination
 
-    # Initialize provider ID tables
     provider_tables = {"imdb": {}, "tvdb": {}, "tmdb": {}}
-    headers = {"X-Emby-Token": api_key}
 
-    # Fetch the total number of items.
+    # Fetch the total number of items
     url = f"{base_url}/Items?StartIndex=0&Limit=0&Recursive=True&ParentId={library_id}&Fields=ProviderIds&Is3D=False"
-    response = httpx.get(url, headers=headers)
-    response.raise_for_status()
-    total_items = response.json().get("TotalRecordCount", 0)
+    try:
+        response = make_http_request(client, "GET", url)
+        total_items = response.json().get("TotalRecordCount", 0)
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        logging.error("Failed to fetch the total number of media items.")
+        return provider_tables  # Return current tables which may be empty
 
     while start_index < total_items:
         url = f"{base_url}/Items?StartIndex={start_index}&Limit={page_size}&Recursive=True&ParentId={library_id}&Fields=ProviderIds&Is3D=False"
-        response = httpx.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        media_items = data.get("Items", [])
-
-        # Process the current chunk of items to build provider ID tables
-        build_provider_id_tables(media_items, provider_tables)
-
-        # Report progress
-        start_index += page_size
-        logging.info(f"Processed {start_index}/{total_items} items.")
+        try:
+            response = make_http_request(client, "GET", url)
+            media_items = response.json().get("Items", [])
+            build_provider_id_tables(media_items, provider_tables)
+            start_index += page_size
+            logging.info(f"Processed {start_index}/{total_items} items.")
+        except (httpx.HTTPStatusError, httpx.RequestError):
+            logging.error(
+                f"Error fetching page of media items starting at index {start_index}"
+            )
+            # Optionally, break or return here if we should stop processing on error
 
     return provider_tables
 
@@ -406,38 +362,26 @@ def generate_report(unique_items: list, duplicates: list) -> None:
 
 
 def delete_items_if_doit(
-    base_url: str, api_key: str, duplicates: list, doit: bool
+    client: httpx.Client, base_url: str, duplicate_items: list, doit: bool
 ) -> None:
     """
     Deletes duplicate media items if the 'doit' flag is true.
 
     Args:
+        client (httpx.Client): The httpx client configured for the Emby server communication.
         base_url (str): Base URL of the Emby server.
-        api_key (str): API key for the Emby server.
-        duplicates (list): A list of duplicate media items to delete.
+        duplicate_items (list): A list of duplicate media items to delete.
         doit (bool): If True, actually perform the deletion.
     """
     if doit:
-        # Placeholder: Perform the deletion of duplicate items using the Emby API.
-        # Replace with actual API call to delete items.
-        for item in duplicates:
-            item_id = item[
-                "Id"
-            ]  # Placeholder: Replace with actual property that holds the Id.
+        for item in duplicate_items:
+            item_id = item["id"]  # Assuming the item comes with the ID labeled as 'id'.
             url = f"{base_url}/Items/{item_id}"
-            headers = {"X-Emby-Token": api_key}
             try:
-                response = httpx.delete(url, headers=headers)
-                response.raise_for_status()
+                response = make_http_request(client, "DELETE", url)
                 logging.info(f"Deleted item with ID {item_id}")
-            except httpx.HTTPStatusError as e:
-                logging.error(
-                    f"Failed to delete item with ID {item_id}: {e.response.content}"
-                )
-            except httpx.RequestError as e:
-                logging.error(
-                    f"An error occurred while deleting item with ID {item_id}: {str(e)}"
-                )
+            except (httpx.HTTPStatusError, httpx.RequestError):
+                logging.error(f"Failed to delete item with ID {item_id}")
     else:
         logging.info(
             "Deletion skipped. Items to be deleted are only listed in the report."
@@ -755,13 +699,13 @@ def main():
             logging.error(f"Unable to connect to the Emby server at {base_url}.")
             sys.exit(1)
 
-        library_id = get_library_id(base_url, api_key, library)
+        library_id = get_library_id(client, base_url, library)
         if library_id is None:
             logging.error(f"Unable to find library '{library}'.")
             sys.exit(1)
 
         # Fetch media items and process them to identify duplicates
-        provider_tables = fetch_and_process_media_items(base_url, api_key, library_id)
+        provider_tables = fetch_and_process_media_items(client, base_url, library_id)
 
         # Dump provider tables to files
         dump_object_to_file(provider_tables, "testing/provider_tables")
