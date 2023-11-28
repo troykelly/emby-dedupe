@@ -1064,6 +1064,23 @@ def process_deletion_and_generate_report(
     return format_markdown_table(base_url, decisions)
 
 
+def output_report_to_stdout(report_content: str) -> None:
+    """
+    Outputs a markdown report to stdout. This output can be captured by CI/CD systems.
+
+    Args:
+        report_content (str): The report data in markdown format.
+    """
+    # Unique delimiters for the report data –– make sure these don't appear in the report content
+    start_delimiter = "EMBY_DEDUPE_REPORT_START"
+    end_delimiter = "EMBY_DEDUPE_REPORT_END"
+
+    # Output the report data as markdown to stdout between delimiters
+    print(start_delimiter)
+    print(report_content)
+    print(end_delimiter)
+
+
 def main():
     # The 'cmd_args' dictionary will store the command line arguments
     args = parse_args()
@@ -1138,23 +1155,31 @@ def main():
         provider_tables = fetch_and_process_media_items(client, base_url, library_id)
 
         # Dump provider tables to files
-        dump_object_to_file(provider_tables, "testing/provider_tables")
+        dump_object_to_file(
+            provider_tables, "testing/provider_tables"
+        ) if logger.isEnabledFor(logging.DEBUG) else None
 
         # Identify duplicates
         duplicates = identify_duplicates(provider_tables)
 
-        dump_object_to_file(duplicates, "testing/duplicates")
+        dump_object_to_file(duplicates, "testing/duplicates") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
 
         # Aggregate duplicates
         duplicates = rationalize_duplicates(duplicates)
 
         # Dump duplicates to files
-        dump_object_to_file(duplicates, "testing/aggregate")
+        dump_object_to_file(duplicates, "testing/aggregate") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
 
         decisions = process_duplicate_groups(client, base_url, duplicates)
 
         # Dump decisions to files
-        dump_object_to_file(decisions, "testing/decisions")
+        dump_object_to_file(decisions, "testing/decisions") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
 
         # decisions = read_json_file("testing/decisions.json")
 
@@ -1163,9 +1188,15 @@ def main():
         )
 
         # Dump deletion results to file
-        dump_object_to_file(decisions, "testing/deletions")
+        dump_object_to_file(decisions, "testing/deletions") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
 
-        dump_object_to_file(markdown_report, "testing/report")
+        dump_object_to_file(markdown_report, "testing/report") if logger.isEnabledFor(
+            logging.DEBUG
+        ) else None
+
+        output_report_to_stdout(markdown_report)
 
     except EmbyServerConnectionError as e:
         logger.error(str(e))
