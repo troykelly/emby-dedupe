@@ -2,6 +2,25 @@
 
 The Emby Deduplication Script Docker container assists in managing media libraries on Emby servers by identifying potential duplicate items. It compares media items within your Emby library and generates a report detailing duplicates that may warrant removal.
 
+## Latest Versions
+
+![GitHub release (latest by date)](https://img.shields.io/github/v/release/troykelly/emby-dedupe)
+![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/troykelly/emby-dedupe?include_prereleases&label=pre-release)
+
+## Multi-Architecture Build Status
+
+![Build Status](https://github.com/troykelly/emby-dedupe/actions/workflows/release.yaml/badge.svg)
+
+The following architectures are supported in the latest version:
+
+| Architecture    | Supported          | Build Status  |
+|-----------------|--------------------|---------------|
+| `amd64`         | :white_check_mark: | ![amd64 Status](#) |
+| `arm64`         | :white_check_mark: | ![arm64 Status](#) |
+| `arm/v7`        | :white_check_mark: | ![armv7 Status](#) |
+| `arm/v6`        | :white_check_mark: | ![armv6 Status](#) |
+| `i386`          | :x:                | ![i386 Status](#)  |
+
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)

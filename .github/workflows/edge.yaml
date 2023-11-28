@@ -1,4 +1,4 @@
-name: Build and Push Multi-Arch Edge Docker Image
+name: Edge Container Build
 
 on:
   push:
