@@ -17,7 +17,11 @@ import backoff
 logger = logging.getLogger("EmbyDedupe")
 logger.setLevel(logging.ERROR)  # Default log level for the tool's logger
 
-MAX_RETRIES = 5  # The maximum number of retries for HTTP requests
+MAX_RETRIES = 20  # The maximum number of retries for HTTP requests
+MAX_BACKOFF_TIME = 600  # Maximum total backoff time in seconds
+PAGE_SIZE = 1000  # The page size for paginated requests
+EMOJI_CHECK = "✅"
+EMOJI_CROSS = "❌"
 
 # Define constants for default values and environmental variable names
 ENV_DEDUPE_LOGGING = "DEDUPE_LOGGING"
@@ -39,39 +43,71 @@ LOGGING_LEVELS = {
 }
 
 
+class DisjointSet:
+    def __init__(self):
+        # Initially, each item is its own parent
+        self.parent = {}
+
+    def find(self, item):
+        # Find the root parent of the item recursively
+        if self.parent[item] != item:
+            self.parent[item] = self.find(self.parent[item])  # Path compression
+        return self.parent[item]
+
+    def union(self, set1, set2):
+        # Perform union of two sets represented by their root items
+        root1 = self.find(set1)
+        root2 = self.find(set2)
+        if root1 != root2:
+            # Attach one tree's root to the other
+            self.parent[root1] = root2
+
+
+# Include the additional imports required for exception handling
+from httpx import HTTPStatusError, ReadTimeout, RequestError
+
+
+def should_give_up(e):
+    # Determine whether the given exception should stop retries
+    is_client_error = (
+        isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500
+    )
+    return is_client_error
+
+
+def handle_giveup(details):
+    """
+    A callback function that will be called when the retry loop has been
+    terminated and is giving up.
+    """
+    logger.error(f"Giving up on request after retries: {details['tries']}")
+
+
 @backoff.on_exception(
     backoff.expo,
-    httpx.HTTPStatusError,  # Retry on HTTP error responses (4xx and 5xx status codes)
-    max_time=60,  # Maximum total backoff time
-    giveup=lambda e: e.response.status_code < 500,  # Don't retry for client errors
-)
-@backoff.on_exception(
-    backoff.expo,
-    httpx.RequestError,  # Retry on request errors like network issues
-    max_time=60,  # Maximum total backoff time
+    (httpx.HTTPStatusError, httpx.ReadTimeout, httpx.RequestError),
+    max_tries=MAX_RETRIES,
+    max_time=MAX_BACKOFF_TIME,
+    giveup=should_give_up,
+    on_giveup=handle_giveup,
 )
 def make_http_request(
     client: httpx.Client, method: str, url: str, **kwargs
 ) -> httpx.Response:
     """
-    Make an HTTP request using the given httpx.Client, with exponential backoff in case of exceptions.
+    Make an HTTP request using the given httpx.Client, equipped with exponential backoff
+    and retry capabilities in case of certain exceptions.
 
-    Args:
-        client (httpx.Client): The httpx client to use for sending the request.
-        method (str): The HTTP method to use (e.g., 'GET', 'POST', 'DELETE').
-        url (str): The URL to which the request is sent.
-        **kwargs: Additional keyword arguments to pass to the client's request method.
-
-    Returns:
-        httpx.Response: The HTTP response from the server.
-
-    Raises:
-        httpx.HTTPStatusError: If the HTTP request returned an unsuccessful status code.
-        httpx.RequestError: If the request transmission failed.
+    The exponential backoff policy will initiate a number of retries with increasing
+    delay intervals if a `ReadTimeout` or other specified errors occur during the request.
     """
-    response = client.request(method, url, **kwargs)
-    response.raise_for_status()
-    return response
+    try:
+        response = client.request(method, url, **kwargs)
+        response.raise_for_status()
+        return response
+    except (HTTPStatusError, ReadTimeout, RequestError) as exc:
+        logger.error(f"Request failed: {exc}. Retrying...")
+        raise
 
 
 def create_http_client(api_key: str) -> httpx.Client:
@@ -117,6 +153,33 @@ def parse_args() -> argparse.Namespace:
         help="Must be provided for the script to remove media.",
     )
     return parser.parse_args()
+
+
+def build_disjoint_set(media_items_by_provider):
+    ds = DisjointSet()
+    # Progress bar for initializing items in the disjoint set
+    items_progress = tqdm(
+        total=sum(
+            len(items)
+            for provider_dict in media_items_by_provider.values()
+            for items in provider_dict.values()
+        ),
+        desc="Building sets",
+        unit="item",
+    )
+    for provider in media_items_by_provider:
+        for _, items in media_items_by_provider[provider].items():
+            for item in items:
+                if item not in ds.parent:
+                    ds.parent[item] = item  # Initialize the item's parent to itself
+                ds.union(
+                    items[0], item
+                )  # Union the first item with the rest in the list
+                items_progress.update(
+                    1
+                )  # Update progress bar each time an item is processed
+    items_progress.close()  # Close progress bar after all items have been processed
+    return ds
 
 
 def set_logging_level(verbosity_count: int, env_verbosity: Optional[str]) -> None:
@@ -319,7 +382,7 @@ def fetch_and_process_media_items(
     Returns:
         Tuple[dict, dict, dict]: Three dictionaries (imdb, tvdb, tmdb) containing provider ID mappings.
     """
-    page_size = 100  # Efficient page size to minimize memory consumption
+    page_size = PAGE_SIZE  # Efficient page size to minimize memory consumption
     start_index = 0  # Starting index for pagination
 
     provider_tables = {"imdb": {}, "tvdb": {}, "tmdb": {}}
@@ -329,24 +392,34 @@ def fetch_and_process_media_items(
     try:
         response = make_http_request(client, "GET", url)
         total_items = response.json().get("TotalRecordCount", 0)
-    except (httpx.HTTPStatusError, httpx.RequestError):
+        logger.info(f"Total media items to fetch: {total_items}")
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
         logger.error("Failed to fetch the total number of media items.")
-        return provider_tables  # Return current tables which may be empty
+        raise e
 
-    while start_index < total_items:
-        url = f"{base_url}/Items?StartIndex={start_index}&Limit={page_size}&Recursive=True&ParentId={library_id}&Fields=ProviderIds&Is3D=False"
-        try:
-            response = make_http_request(client, "GET", url)
-            media_items = response.json().get("Items", [])
-            build_provider_id_tables(media_items, provider_tables)
-            start_index += page_size
-            logger.info(f"Processed {start_index}/{total_items} items.")
-        except (httpx.HTTPStatusError, httpx.RequestError):
-            logger.error(
-                f"Error fetching page of media items starting at index {start_index}"
-            )
-            # Optionally, break or return here if we should stop processing on error
+    # Initialize progress bar
+    progress_bar = tqdm(total=total_items, desc="Fetching media items", unit="item")
 
+    try:
+        # Continue fetching until all pages are processed
+        while start_index < total_items:
+            url = f"{base_url}/Items?StartIndex={start_index}&Limit={page_size}&Recursive=True&ParentId={library_id}&Fields=ProviderIds&Is3D=False"
+            try:
+                response = make_http_request(client, "GET", url)
+                media_items = response.json().get("Items", [])
+                build_provider_id_tables(media_items, provider_tables)
+                processed_items = len(media_items)  # Get the number of items processed
+                start_index += processed_items
+                progress_bar.update(processed_items)  # Update progress bar
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                logger.error(
+                    f"Error fetching page of media items starting at index {start_index}"
+                )
+                raise e  # Raise the exception to indicate failure in the higher-level process
+    finally:
+        progress_bar.close()  # Ensure the progress bar is closed after processing is complete
+
+    # Return provider ID tables
     return provider_tables
 
 
@@ -446,10 +519,10 @@ def get_library_id(
 
 def dump_object_to_file(obj: Any, base_filename: str) -> None:
     """
-    Attempts to serialize and save an object to a file.
-    If the object is serializable to JSON, it's saved as pretty JSON with a '.json' extension.
-    If it's a binary object, it's saved as is with a '.bin' extension.
-    If it's a text object, it's saved as text with a '.txt' extension.
+    Attempts to serialize and save an object to a file. It saves objects as:
+        - Pretty JSON if the object is a dictionary or list.
+        - Plain text if it's a string.
+        - Binary if the object is bytes.
 
     Args:
         obj (Any): The object to be saved to a file.
@@ -458,132 +531,63 @@ def dump_object_to_file(obj: Any, base_filename: str) -> None:
     Raises:
         ValueError: If the object type cannot be determined or handled by the function.
     """
-    # Try to save as JSON
-    try:
-        json_data = json.dumps(obj, indent=4)
-        full_filename = f"{base_filename}.json"
-        with open(full_filename, "w", encoding="utf-8") as file:
-            file.write(json_data)
-        print(f"Object saved as JSON to {full_filename}")
-        return
-    except TypeError:
-        pass  # Object is not JSON serializable, moving to the next check
+    # Paths for different file types
+    json_path = f"{base_filename}.json"
+    text_path = f"{base_filename}.txt"
+    bin_path = f"{base_filename}.bin"
 
-    # Check if it's binary data
-    if isinstance(obj, bytes):
-        full_filename = f"{base_filename}.bin"
-        with open(full_filename, "wb") as file:
-            file.write(obj)
-        print(f"Object saved as binary to {full_filename}")
-        return
+    # Check if the object is serializable to JSON (dict or list)
+    if isinstance(obj, (dict, list)):
+        try:
+            with open(json_path, "w", encoding="utf-8") as json_file:
+                json.dump(obj, json_file, indent=4)
+            logger.debug(f"Object saved as JSON to {json_path}")
+            return
+        except TypeError as e:
+            logger.error(f"Failed to serialize object to JSON: {e}")
+            # Fall through to other types if JSON serialization fails
 
-    # Check if it's text data
+    # Check if it's text data (string)
     if isinstance(obj, str):
-        full_filename = f"{base_filename}.txt"
-        with open(full_filename, "w", encoding="utf-8") as file:
-            file.write(obj)
-        print(f"Object saved as text to {full_filename}")
+        with open(text_path, "w", encoding="utf-8") as text_file:
+            text_file.write(obj)
+        logger.debug(f"Text object saved to {text_path}")
+        return
+
+    # Check if it's binary data (bytes)
+    if isinstance(obj, bytes):
+        with open(bin_path, "wb") as bin_file:
+            bin_file.write(obj)
+        logger.debug(f"Binary object saved to {bin_path}")
         return
 
     # If none of the above, raise an error
-    raise ValueError("Object type is not supported for dumping to a file.")
+    raise ValueError("Unsupported object type for dumping to a file.")
 
 
-def determine_items_to_delete(
-    client: httpx.Client, base_url: str, duplicate_ids: list
-) -> dict:
+def read_json_file(file_path: str) -> Optional[Any]:
     """
-    Determines the best quality media item to keep and marks the rest for deletion.
-    The criteria for the best quality is based on resolution, codec preference, interlacing,
-    bitrate, bit depth, and file size.
+    Attempts to read a JSON file and return its contents as a Python object.
 
     Args:
-        client (httpx.Client): The httpx client configured for the Emby server communication.
-        base_url (str): Base URL of the Emby server.
-        duplicate_ids (list): A list of IDs of potentially duplicate media items.
+        file_path (str): Path to the JSON file to be read.
 
     Returns:
-        dict: A dictionary containing details of the item to keep and the ones to delete.
+        Optional[Any]: Parsed JSON data if the file is successfully read and parsed, None otherwise.
     """
-    items = []
-
-    # Fetch detailed item information
-    for item_id in duplicate_ids:
-        url = f"{base_url}/Items/{item_id}?Fields=MediaStreams,Path"
-        try:
-            response = make_http_request(client, "GET", url)
-            items.append(response.json())
-        except (httpx.HTTPStatusError, httpx.RequestError):
-            logger.error(f"Error fetching details for item with ID {item_id}")
-            continue  # Skip this item and log the error but continue processing
-
-    # Sort items by quality based on provided criteria
-    items.sort(
-        key=lambda i: (
-            # Resolution (first by height then by width)
-            max(
-                stream.get("Height", 0)
-                for stream in i["MediaStreams"]
-                if stream["Type"] == "Video"
-            ),
-            max(
-                stream.get("Width", 0)
-                for stream in i["MediaStreams"]
-                if stream["Type"] == "Video"
-            ),
-            # Codec preference (HEVC > h264)
-            -1
-            if any(
-                stream.get("Codec") in ["hevc", "h265"]
-                for stream in i["MediaStreams"]
-                if stream["Type"] == "Video"
-            )
-            else 0,
-            # Interlacing (prefer progressive)
-            0
-            if any(
-                not stream.get("IsInterlaced", True)
-                for stream in i["MediaStreams"]
-                if stream["Type"] == "Video"
-            )
-            else 1,
-            # Bit rate and bit depth (prefer higher)
-            max(
-                (stream.get("BitRate", 0), stream.get("BitDepth", 0))
-                for stream in i["MediaStreams"]
-                if stream["Type"] == "Video"
-            ),
-            # File size (prefer larger)
-            i["Size"],
-        ),
-        reverse=True,
-    )
-
-    # The first item is the best quality; the rest are duplicates
-    best_item = items[0] if items else None
-    duplicate_items = items[1:] if items else []
-
-    if not best_item:
-        raise ValueError(
-            "No best item could be determined from the provided duplicate IDs."
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        logger.error(f"File not found: {file_path}")
+    except json.JSONDecodeError as exc:
+        logger.error(f"Error parsing JSON file at {file_path}: {exc}")
+    except Exception as exc:
+        logger.error(
+            f"An unexpected error occurred while reading file {file_path}: {exc}"
         )
 
-    return {
-        "keep": {
-            "id": best_item["Id"],
-            "name": best_item["Name"],
-            "path": best_item["Path"],
-            "quality": get_quality_description(best_item),
-        },
-        "delete": [
-            {
-                "id": item["Id"],
-                "name": item["Name"],
-                "quality": get_quality_description(item),
-            }
-            for item in duplicate_items
-        ],
-    }
+    return None
 
 
 def get_quality_description(item):
@@ -620,49 +624,325 @@ def get_quality_description(item):
     }
 
 
-def merge_duplicate_groups(duplicates_by_provider: dict) -> list:
+def rationalize_duplicates(media_items_by_provider):
+    ds = build_disjoint_set(media_items_by_provider)
+
+    # Progress bar for grouping items
+    grouping_progress = tqdm(
+        total=len(ds.parent), desc="Grouping duplicates", unit="item"
+    )
+
+    groups = {}
+    for item in ds.parent:
+        root = ds.find(item)
+        if root not in groups:
+            groups[root] = {item}
+        else:
+            groups[root].add(item)
+        grouping_progress.update(1)  # Update progress bar for each item grouped
+    grouping_progress.close()  # Close progress bar after all items have been processed
+
+    # Convert the sets to lists (because JSON can't represent sets)
+    rationalized_list = [list(group) for group in groups.values() if len(group) > 1]
+    return rationalized_list
+
+
+def fetch_items_details(client: httpx.Client, base_url: str, item_ids: list) -> list:
     """
-    Merges duplicate lists from all providers into groups of potential duplicates.
-    Items are considered duplicates if they have a match in any provider.
+    Fetches the details for a list of media items by their IDs in one API request.
 
     Args:
-        duplicates_by_provider (dict): Dictionary of duplicates by provider, mapping provider IDs to item ID lists.
+        client (httpx.Client): The httpx client configured for the Emby server communication.
+        base_url (str): Base URL of the Emby server.
+        item_ids (list): List of item IDs to fetch details for.
 
     Returns:
-        list: A list of lists, where each inner list is a group of potential duplicate IDs.
+        list: A list of media items with detailed information.
     """
-    duplicate_groups = []
+    # Comma-separated item IDs for the query parameter
+    ids_param = ",".join(item_ids)
+    url = f"{base_url}/Items?Fields=MediaStreams,Path,ProviderIds&Ids={ids_param}"
 
-    def merge_into_groups(dup_ids):
-        nonlocal duplicate_groups
-        merged_group = set()
-        remaining_groups = []
+    try:
+        response = make_http_request(client, "GET", url)
+        items = response.json().get("Items", [])
+        return items
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        logger.error(f"Failed to fetch details for items: {e}")
+        return []
 
-        # Determine if the IDs should be merged with an existing group
-        for existing_group in duplicate_groups:
-            if any(dup_id in existing_group for dup_id in dup_ids):
-                merged_group.update(existing_group)
-            else:
-                remaining_groups.append(existing_group)
 
-        # Merge the IDs with any intersecting group or add as a new group
-        if merged_group:
-            merged_group.update(dup_ids)
-            remaining_groups.append(merged_group)
-        else:
-            remaining_groups.append(set(dup_ids))
+def determine_items_to_delete(duplicate_ids: list, all_items_details: list) -> dict:
+    """
+    Determines the best quality media item to keep and marks the rest for deletion.
+    The criteria for the best quality is based on resolution, audio channels, bitrate, and file size.
 
-        duplicate_groups = remaining_groups
+    Args:
+        duplicate_ids (list): A list of IDs of potentially duplicate media items.
+        all_items_details (list): Detailed media items information, including MediaStreams.
 
-    # Iterate over each provider and merge their duplicates into the groups with progress bar
-    for provider, provider_duplicates in tqdm(
-        duplicates_by_provider.items(), desc="Merging duplicate groups"
-    ):
-        for dup_ids in provider_duplicates.values():
-            merge_into_groups(dup_ids)
+    Returns:
+        dict: A dictionary containing details of the item to keep and the ones to delete.
+    """
+    # Process and rate each item based on quality factors
+    rated_items = rate_media_items(all_items_details)
 
-    # Convert sets back to lists for JSON serialization
-    return [list(group) for group in duplicate_groups]
+    # Sort items by their quality rating (higher is better)
+    rated_items.sort(key=lambda x: x["rating"], reverse=True)
+
+    # The first item in the sorted list is the best quality; the rest are duplicates
+    item_to_keep = rated_items[0]
+    items_to_delete = rated_items[1:]
+
+    return {"keep": item_to_keep, "delete": items_to_delete}
+
+
+def rate_media_items(items):
+    """
+    Assigns a quality rating to each media item based on its attributes.
+
+    Args:
+        items (list): List of media items.
+
+    Returns:
+        list: Rated media items, each with a 'rating' key indicating its quality score.
+    """
+    rated_items = []
+    for item in items:
+        video_stream = next(
+            (s for s in item["MediaStreams"] if s["Type"] == "Video"), None
+        )
+        audio_stream = next(
+            (s for s in item["MediaStreams"] if s["Type"] == "Audio"), None
+        )
+
+        # Define quality factors and their corresponding weights
+        quality_factors = {
+            "resolution": (
+                video_stream.get("Height", 0) * video_stream.get("Width", 0)
+                if video_stream
+                else 0,
+                1,
+            ),
+            "audio_channels": (
+                audio_stream.get("Channels", 0) if audio_stream else 0,
+                0.5,
+            ),
+            "bitrate": (item.get("Bitrate", 0), 0.2),
+            "file_size": (item.get("Size", 0), 0.3),
+        }
+
+        # Calculate the weighted quality rating
+        quality_rating = sum(
+            value * weight for value, weight in quality_factors.values()
+        )
+
+        # Include the quality rating and relevant details in the result
+        rated_items.append(
+            {
+                "id": item["Id"],
+                "name": item["Name"],
+                "path": item["Path"],
+                "serverid": item["ServerId"],
+                "rating": quality_rating,
+                "quality_description": get_quality_description(
+                    item
+                ),  # function to extract quality description from item
+            }
+        )
+
+    return rated_items
+
+
+def process_duplicate_groups(
+    client: httpx.Client, base_url: str, duplicate_groups: list
+) -> list:
+    """
+    Processes each group of duplicate items to identify the item to keep and the ones to delete.
+
+    Args:
+        client (httpx.Client): The httpx client configured for the Emby server communication.
+        base_url (str): Base URL of the Emby server.
+        duplicate_groups (list): A list of lists, where each inner list contains IDs of potentially duplicate items.
+
+    Returns:
+        list: A list of dictionaries containing items to keep and delete for each group.
+    """
+    decisions = []
+    # Progress bar for the overall process
+    progress_bar = tqdm(
+        total=len(duplicate_groups), desc="Processing duplicate groups", unit="group"
+    )
+
+    for group in duplicate_groups:
+        # Fetch details for all items in the group
+        items_details = fetch_items_details(client, base_url, group)
+        if items_details:
+            # Determine which items to delete within this group
+            decision = determine_items_to_delete(group, items_details)
+            decisions.append(decision)
+        progress_bar.update(1)  # Update progress bar for each processed group
+
+    progress_bar.close()  # Close progress bar after all groups have been processed
+    return decisions
+
+
+def delete_item(client: httpx.Client, base_url: str, item_id: str, doit: bool) -> dict:
+    """
+    Deletes a media item by its ID if the doit flag is True.
+
+    Args:
+        client (httpx.Client): The httpx client configured for the Emby server communication.
+        base_url (str): The base URL of the Emby server.
+        item_id (str): The ID of the media item to be deleted.
+        doit (bool): If True, the media item will be deleted; otherwise, no action is taken.
+
+    Returns:
+        dict: The deletion status and any error message if the deletion failed.
+    """
+    deleted_status = {"id": item_id, "status": "skipped", "error": None}
+    if doit:
+        url = f"{base_url}/Items/{item_id}"
+        try:
+            response = client.delete(url)
+            deleted_status["status"] = (
+                "success" if response.status_code == 204 else "failed"
+            )
+        except Exception as e:
+            deleted_status.update({"status": "failed", "error": str(e)})
+    return deleted_status
+
+
+def get_emoji_for_status(status):
+    return EMOJI_CHECK if status == "success" else EMOJI_CROSS
+
+
+def format_individual_item(item, base_url, decision):
+    """
+    Formats an individual item to be marked for deletion with an emoji and as a markdown link.
+
+    Args:
+        item (dict): The item information.
+        base_url (str): The base URL of the Emby server.
+        decision (dict): The decision information contains the item to keep.
+
+    Returns:
+        str: Formatted markdown string with emoji and link for the item.
+    """
+    name_match_emoji = (
+        EMOJI_CHECK if item["name"] == decision["keep"]["name"] else EMOJI_CROSS
+    )
+    item_link = f"[{item['id']}]({base_url}/web/index.html#!/item?id={item['id']}&serverId={decision['keep']['serverid']})"
+    deletion_status = next(
+        (d for d in decision["deleted"] if d["id"] == item["id"]), {}
+    )
+    status_emoji = get_emoji_for_status(deletion_status.get("status", "skipped"))
+    error_message = deletion_status.get("error", "")
+    return (
+        f"{name_match_emoji} {item_link} {item['name']}{status_emoji} {error_message}"
+    )
+
+
+def format_markdown_table(base_url: str, decisions: list) -> str:
+    """
+    Formats the decisions into a markdown table.
+
+    Args:
+        base_url (str): The base URL of the Emby server.
+        decisions (list): List of decision objects containing items to keep and delete.
+
+    Returns:
+        str: A formatted markdown table as a string.
+    """
+
+    def get_deletion_status_emoji(status):
+        return EMOJI_CHECK if status == "success" else EMOJI_CROSS
+
+    # Headers
+    headers = ["ID", "Title", "Codec", "Size", "Items to Delete"]
+    max_widths = {header: len(header) for header in headers}
+
+    # Determine the maximum width for each column
+    for decision in decisions:
+        keep = decision["keep"]
+        max_widths["ID"] = max(max_widths["ID"], len(keep["id"]))
+        max_widths["Title"] = max(max_widths["Title"], len(keep["name"]))
+        max_widths["Codec"] = max(
+            max_widths["Codec"], len(keep["quality_description"]["video"]["codec"])
+        )
+        max_widths["Size"] = max(
+            max_widths["Size"], len(str(keep["quality_description"]["size"]))
+        )
+
+        deletion_entries = [
+            format_individual_item(item, base_url, decision)
+            for item in decision["delete"]
+        ]
+        max_widths["Items to Delete"] = max(
+            max_widths["Items to Delete"], max(len(entry) for entry in deletion_entries)
+        )
+
+    header_line = (
+        "| "
+        + " | ".join(f"{header:<{max_widths[header]}}" for header in headers)
+        + " |\n"
+    )
+    separator_line = (
+        "|-" + "-|-".join(f"{'':-<{max_widths[header]}}" for header in headers) + "-|\n"
+    )
+
+    # Rows
+    rows = []
+    for decision in decisions:
+        keep = decision["keep"]
+        id_link = f"[{keep['id']}]({base_url}/web/index.html#!/item?id={keep['id']}&serverId={decision['keep']['serverid']})"
+        keep_name = keep["name"]
+        keep_codec = keep["quality_description"]["video"]["codec"]
+        keep_size = str(keep["quality_description"]["size"])
+        delete_entries = "<br>".join(
+            format_individual_item(item, base_url, decision)
+            for item in decision["delete"]
+        )
+        row = (
+            f"| {id_link:<{max_widths['ID']}} "
+            f"| {keep_name:<{max_widths['Title']}} "
+            f"| {keep_codec:<{max_widths['Codec']}} "
+            f"| {keep_size:<{max_widths['Size']}} "
+            f"| {delete_entries:<{max_widths['Items to Delete']}} |\n"
+        )
+        rows.append(row)
+
+    markdown_table = header_line + separator_line + "".join(rows)
+    return markdown_table
+
+
+def process_deletion_and_generate_report(
+    client: httpx.Client, base_url: str, decisions: list, doit: bool
+) -> str:
+    """
+    Processes deletions based on the decisions and generates a markdown report.
+
+    Args:
+        client (httpx.Client): The httpx client configured for the Emby server communication.
+        base_url (str): The base URL of the Emby server.
+        decisions (list): A list of decision objects containing items to keep and delete.
+        doit (bool): If True, the deletion process will be attempted; otherwise, it is only simulated.
+
+    Returns:
+        str: The generated markdown report.
+    """
+    # Process deletions and update decisions with deletion results
+    for decision in decisions:
+        delete_results = []
+        for item in decision["delete"]:
+            deletion_result = delete_item(client, base_url, item["id"], doit)
+            delete_results.append(deletion_result)
+        # Update the decision object with deletion results
+        decision["deleted"] = delete_results
+
+    # Generate report in markdown format
+    report = format_markdown_table(base_url, decisions)
+    return report
 
 
 def main():
@@ -738,10 +1018,21 @@ def main():
         dump_object_to_file(duplicates, "testing/duplicates")
 
         # Aggregate duplicates
-        duplicates = merge_duplicate_groups(duplicates)
+        duplicates = rationalize_duplicates(duplicates)
 
         # Dump duplicates to files
         dump_object_to_file(duplicates, "testing/aggregate")
+
+        decisions = process_duplicate_groups(client, base_url, duplicates)
+
+        # Dump decisions to files
+        dump_object_to_file(decisions, "testing/decisions")
+
+        markdown_report = process_deletion_and_generate_report(
+            client, base_url, decisions, doit
+        )
+
+        dump_object_to_file(markdown_report, "testing/report")
 
     except EmbyServerConnectionError as e:
         logger.error(str(e))
