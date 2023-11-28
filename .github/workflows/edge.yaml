@@ -5,6 +5,11 @@ on:
     branches:
       - main
 
+# Ensures that only the latest edge workflow is running
+concurrency:
+  group: edge-workflow
+  cancel-in-progress: true
+
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
