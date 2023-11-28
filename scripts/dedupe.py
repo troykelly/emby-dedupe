@@ -12,6 +12,7 @@ import json
 import os
 from typing import Any
 import backoff
+import hashlib
 
 # At the top of your script, after the imports, establish a logger for the tool
 logger = logging.getLogger("EmbyDedupe")
@@ -30,6 +31,8 @@ ENV_DEDUPE_EMBY_PORT = "DEDUPE_EMBY_PORT"
 ENV_DEDUPE_EMBY_API_KEY = "DEDUPE_EMBY_API_KEY"
 ENV_DEDUPE_EMBY_LIBRARY = "DEDUPE_EMBY_LIBRARY"
 ENV_DEDUPE_DOIT = "DEDUPE_DOIT"
+ENV_DEDUPE_EMBY_USERNAME = "DEDUPE_EMBY_USERNAME"
+ENV_DEDUPE_EMBY_PASSWORD = "DEDUPE_EMBY_PASSWORD"
 
 DEFAULT_PORT_HTTP = 80
 DEFAULT_PORT_HTTPS = 443
@@ -110,19 +113,123 @@ def make_http_request(
         raise
 
 
-def create_http_client(api_key: str) -> httpx.Client:
+def get_auth_token(
+    client: httpx.Client, base_url: str, username: str, password: str
+) -> Tuple[str, str]:
     """
-    Create an httpx.Client instance with API key headers.
+    Retrieves the authentication token for a given username and password pair.
 
     Args:
-        api_key (str): The API key for the Emby server.
+        client (httpx.Client): The httpx client object.
+        base_url (str): The base URL of the Emby server.
+        username (str): The username for authentication.
+        password (str): The password for authentication.
 
     Returns:
-        httpx.Client: A client instance configured for communication with Emby server.
+        Tuple[str, str]: The authentication token and user's GUID received from Emby server.
+
+    Raises:
+        EmbyServerConnectionError: If an error occurs while authenticating.
     """
-    headers = {"X-Emby-Token": api_key}
-    client = httpx.Client(headers=headers)
-    return client
+    sha1_password = hashlib.sha1(password.encode("utf-8")).hexdigest()
+    auth_url = f"{base_url}/Users/AuthenticateByName"
+    data = {"Username": username, "Pw": password, "Password": sha1_password}
+    headers = {
+        "X-Emby-Authorization": 'MediaBrowser Client="media_cleaner", Device="Scripted Client", DeviceId="scripted_client", Version="0.1", Token=""',
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = client.post(auth_url, headers=headers, json=data)
+        response.raise_for_status()
+        response_data = response.json()
+        access_token = response_data.get("AccessToken")
+        user_id = response_data.get("User").get("Id")
+        if not access_token or not user_id:
+            raise EmbyServerConnectionError(
+                "Failed to retrieve access token or user ID from Emby server."
+            )
+        logger.info("Successfully authenticated with Emby server.")
+        return access_token, user_id
+    except httpx.HTTPStatusError as e:
+        raise EmbyServerConnectionError(
+            f"HTTP status error during authentication: {e.response.content}"
+        )
+    except httpx.RequestError as e:
+        raise EmbyServerConnectionError(
+            f"HTTP request error during authentication: {e}"
+        )
+
+
+def logout(client: httpx.Client, base_url: str, auth_token: str) -> None:
+    """
+    Logs out from the Emby server to invalidate the authentication token.
+
+    Args:
+        client (httpx.Client): The httpx client object.
+        base_url (str): The base URL of the Emby server.
+        auth_token (str): The authentication token to be invalidated.
+    """
+    logout_url = f"{base_url}/Sessions/Logout"
+    headers = {
+        "X-Emby-Token": auth_token,
+    }
+
+    try:
+        client.post(logout_url, headers=headers)
+        logger.info("Successfully logged out from Emby server.")
+    except Exception as e:
+        logger.error(f"Failed to log out from Emby server: {e}")
+        # In the main() function, near the start after validating required arguments:
+
+        # Retrieve auth variables
+        env_username = get_env_variable(ENV_DEDUPE_EMBY_USERNAME)
+        env_password = get_env_variable(ENV_DEDUPE_EMBY_PASSWORD)
+
+        # Validate auth arguments
+        if not env_username or not env_password:
+            logger.error(
+                "Emby authentication credentials USERNAME and PASSWORD are required."
+            )
+            sys.exit(1)
+
+        # Authenticate and set auth token
+        auth_token = get_auth_token(client, base_url, env_username, env_password)
+        client.headers.update({"X-Emby-Token": auth_token})
+
+    # At the end of the main() function, make sure to log out:
+
+    finally:
+        # Logout from Emby server if authenticated
+        if auth_token:
+            logout(client, base_url, auth_token)
+
+
+def create_http_client(base_url: str, username: str, password: str) -> httpx.Client:
+    """
+    Create an httpx.Client instance and authenticate with the Emby server to receive
+    an access token for subsequent API calls.
+
+    Args:
+        base_url (str): The base URL of the Emby server.
+        username (str): The username for the Emby server.
+        password (str): The password for the Emby server.
+
+    Returns:
+        httpx.Client: A client instance configured for communication with the Emby server.
+
+    Raises:
+        EmbyServerConnectionError: If an error occurs while authenticating.
+    """
+    client = httpx.Client()
+    auth_token, user_id = get_auth_token(client, base_url, username, password)
+    client.headers.update(
+        {
+            "X-Emby-Token": auth_token,
+            # 'X-Emby-Authorization' header can be constructed here if required for all requests
+        }
+    )
+    return client, auth_token, user_id
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,6 +258,16 @@ def parse_args() -> argparse.Namespace:
         "--doit",
         action="store_true",
         help="Must be provided for the script to remove media.",
+    )
+    parser.add_argument(
+        "--username",
+        type=str,
+        help="The Emby username to use for authentication.",
+    )
+    parser.add_argument(
+        "--password",
+        type=str,
+        help="The Emby password to use for authentication.",
     )
     return parser.parse_args()
 
@@ -243,7 +360,11 @@ def get_env_variable(name: str) -> Optional[str]:
 
 
 def validate_required_arguments(
-    host: Optional[str], api_key: Optional[str], library: Optional[str]
+    host: Optional[str],
+    api_key: Optional[str],
+    library: Optional[str],
+    username: Optional[str],
+    password: Optional[str],
 ):
     """Validate that required arguments are provided.
 
@@ -251,10 +372,18 @@ def validate_required_arguments(
         host (Optional[str]): The host of the Emby server.
         api_key (Optional[str]): The API key for the Emby server.
         library (Optional[str]): The library to scan for duplicates.
+        username (Optional[str]): The username to use for authentication.
+        password (Optional[str]): The password to use for authentication.
     """
     missing_args = []
 
-    for arg, value in {"host": host, "api-key": api_key, "library": library}.items():
+    for arg, value in {
+        "host": host,
+        "api-key": api_key,
+        "library": library,
+        "username": username,
+        "password": password,
+    }.items():
         if not value:
             missing_args.append(arg)
 
@@ -762,28 +891,44 @@ def process_duplicate_groups(
 
 def delete_item(client: httpx.Client, base_url: str, item_id: str, doit: bool) -> dict:
     """
-    Deletes a media item by its ID if the doit flag is True.
+    Attempts to delete a media item by its ID if the 'doit' flag is True.
 
     Args:
         client (httpx.Client): The httpx client configured for the Emby server communication.
         base_url (str): The base URL of the Emby server.
         item_id (str): The ID of the media item to be deleted.
-        doit (bool): If True, the media item will be deleted; otherwise, no action is taken.
+        doit (bool): If True, actually performs the delete action, otherwise just simulates it.
 
     Returns:
         dict: The deletion status and any error message if the deletion failed.
     """
-    deleted_status = {"id": item_id, "status": "skipped", "error": None}
+    deletion_status = {"id": item_id, "status": "not_attempted", "error": None}
     if doit:
         url = f"{base_url}/Items/{item_id}"
         try:
             response = client.delete(url)
-            deleted_status["status"] = (
-                "success" if response.status_code == 204 else "failed"
-            )
+            if response.is_success:
+                deletion_status["status"] = "success"
+            else:
+                # If the response was not successful, log the status code and content for debugging
+                deletion_status.update(
+                    {
+                        "status": "failed",
+                        "error": f"Status code: {response.status_code}, Response: {response.text}",
+                    }
+                )
+                logger.error(
+                    f"Deletion failed for item {item_id}, "
+                    f"{url} [{response.status_code}] Response: {response.text}"
+                )
         except Exception as e:
-            deleted_status.update({"status": "failed", "error": str(e)})
-    return deleted_status
+            # Set the error message in the deletion status and log it for debugging
+            deletion_status.update({"status": "failed", "error": str(e)})
+            logger.error(f"Exception occurred during deletion of item {item_id}: {e}")
+    else:
+        deletion_status["status"] = "skipped"
+
+    return deletion_status
 
 
 def get_emoji_for_status(status):
@@ -940,6 +1085,8 @@ def main():
     env_api_key = get_env_variable(ENV_DEDUPE_EMBY_API_KEY)
     env_library = get_env_variable(ENV_DEDUPE_EMBY_LIBRARY)
     env_doit = get_env_variable(ENV_DEDUPE_DOIT) in ("true", "True", "TRUE", "1")
+    env_username = get_env_variable(ENV_DEDUPE_EMBY_USERNAME)
+    env_password = get_env_variable(ENV_DEDUPE_EMBY_PASSWORD)
 
     # Set logging verbosity
     set_logging_level(args.verbosity, env_verbosity)
@@ -952,6 +1099,8 @@ def main():
     override_warning("--port", args.port and str(args.port), env_port)
     override_warning("--api-key", args.api_key, env_api_key)
     override_warning("--library", args.library, env_library)
+    override_warning("--username", args.username, env_username)
+    override_warning("--password", args.password, env_password)
 
     # Final values with command-line arguments taking precedence over environment variables
     logger.debug("Collecting final values for required settings")
@@ -960,9 +1109,11 @@ def main():
     api_key = args.api_key or env_api_key
     library = args.library or env_library
     doit = args.doit or env_doit
+    username = args.username or env_username
+    password = args.password or env_password
 
     # Validate required arguments
-    validate_required_arguments(host, api_key, library)
+    validate_required_arguments(host, api_key, library, username, password)
 
     # Validate and handle host and port information
     validated_host, validated_port = handle_host_and_port(host, port)
@@ -974,10 +1125,13 @@ def main():
     )
 
     try:
-        client = create_http_client(api_key)
-
         # Determine the base URL, using HTTPS if the validated port is 443
         base_url = f"{validated_host}:{validated_port}"
+
+        # Create an authenticated HTTP client
+        client, auth_token, user_id = create_http_client(
+            base_url, env_username, env_password
+        )
 
         # Check connection to Emby server
         connection_url = f"{base_url}/System/Info"
@@ -990,27 +1144,29 @@ def main():
             logger.error(f"Unable to find library '{library}'.")
             sys.exit(1)
 
-        # Fetch media items and process them to identify duplicates
-        provider_tables = fetch_and_process_media_items(client, base_url, library_id)
+        # # Fetch media items and process them to identify duplicates
+        # provider_tables = fetch_and_process_media_items(client, base_url, library_id)
 
-        # Dump provider tables to files
-        dump_object_to_file(provider_tables, "testing/provider_tables")
+        # # Dump provider tables to files
+        # dump_object_to_file(provider_tables, "testing/provider_tables")
 
-        # Identify duplicates
-        duplicates = identify_duplicates(provider_tables)
+        # # Identify duplicates
+        # duplicates = identify_duplicates(provider_tables)
 
-        dump_object_to_file(duplicates, "testing/duplicates")
+        # dump_object_to_file(duplicates, "testing/duplicates")
 
-        # Aggregate duplicates
-        duplicates = rationalize_duplicates(duplicates)
+        # # Aggregate duplicates
+        # duplicates = rationalize_duplicates(duplicates)
 
-        # Dump duplicates to files
-        dump_object_to_file(duplicates, "testing/aggregate")
+        # # Dump duplicates to files
+        # dump_object_to_file(duplicates, "testing/aggregate")
 
-        decisions = process_duplicate_groups(client, base_url, duplicates)
+        # decisions = process_duplicate_groups(client, base_url, duplicates)
 
-        # Dump decisions to files
-        dump_object_to_file(decisions, "testing/decisions")
+        # # Dump decisions to files
+        # dump_object_to_file(decisions, "testing/decisions")
+
+        decisions = read_json_file("testing/decisions.json")
 
         markdown_report = process_deletion_and_generate_report(
             client, base_url, decisions, doit
@@ -1024,6 +1180,8 @@ def main():
     except EmbyServerConnectionError as e:
         logger.error(str(e))
         sys.exit(1)
+    finally:
+        logout(client, base_url, auth_token)
 
 
 if __name__ == "__main__":
