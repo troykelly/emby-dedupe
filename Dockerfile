@@ -48,9 +48,15 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy the built application from the build stage to the final stage
 COPY --from=build-stage /build/dedupe.py ./dedupe.py
 
+# Copy everything from rootfs to the root of the container
+COPY rootfs/ /
+
+# Set correct permissions for the entrypoint script
+RUN chmod +x /usr/local/sbin/entrypoint
+
 # We run our application as a non-root user for security reasons.
 RUN useradd --create-home --shell /bin/bash embyuser
 USER embyuser
 
-# Our application logs to stdout/stderr, so no need to keep a separate log file
-CMD ["python", "./dedupe.py"]
+# Set the entrypoint script as the Docker entrypoint
+ENTRYPOINT ["/usr/local/sbin/entrypoint"]
