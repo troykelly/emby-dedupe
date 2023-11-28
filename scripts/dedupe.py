@@ -13,6 +13,7 @@ import os
 from typing import Any
 import backoff
 import hashlib
+from httpx import HTTPStatusError, ReadTimeout, RequestError
 
 # At the top of your script, after the imports, establish a logger for the tool
 logger = logging.getLogger("EmbyDedupe")
@@ -20,6 +21,7 @@ logger.setLevel(logging.ERROR)  # Default log level for the tool's logger
 
 MAX_RETRIES = 20  # The maximum number of retries for HTTP requests
 MAX_BACKOFF_TIME = 600  # Maximum total backoff time in seconds
+HTTP_TIMEOUT = 120  # HTTP timeout in seconds (2 minutes)
 PAGE_SIZE = 1000  # The page size for paginated requests
 EMOJI_CHECK = "✅"
 EMOJI_CROSS = "❌"
@@ -66,10 +68,6 @@ class DisjointSet:
             self.parent[root1] = root2
 
 
-# Include the additional imports required for exception handling
-from httpx import HTTPStatusError, ReadTimeout, RequestError
-
-
 def should_give_up(e):
     # Determine whether the given exception should stop retries
     is_client_error = (
@@ -105,11 +103,14 @@ def make_http_request(
     delay intervals if a `ReadTimeout` or other specified errors occur during the request.
     """
     try:
-        response = client.request(method, url, **kwargs)
+        timeout = kwargs.pop(
+            "timeout", HTTP_TIMEOUT
+        )  # Use default if timeout is not specified
+        response = client.request(method, url, timeout=timeout, **kwargs)
         response.raise_for_status()
         return response
     except (HTTPStatusError, ReadTimeout, RequestError) as exc:
-        logger.error(f"Request failed: {exc}. Retrying...")
+        logger.warn(f"Request failed: {exc}. Retrying...")
         raise
 
 
@@ -196,13 +197,6 @@ def logout(client: httpx.Client, base_url: str, auth_token: str) -> None:
         # Authenticate and set auth token
         auth_token = get_auth_token(client, base_url, env_username, env_password)
         client.headers.update({"X-Emby-Token": auth_token})
-
-    # At the end of the main() function, make sure to log out:
-
-    finally:
-        # Logout from Emby server if authenticated
-        if auth_token:
-            logout(client, base_url, auth_token)
 
 
 def create_http_client(base_url: str, username: str, password: str) -> httpx.Client:
