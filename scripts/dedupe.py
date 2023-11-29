@@ -20,6 +20,10 @@ from httpx import HTTPStatusError, ReadTimeout, RequestError
 logger = logging.getLogger("EmbyDedupe")
 logger.setLevel(logging.ERROR)  # Default log level for the tool's logger
 
+# Global variables to hold the authenticated token and user ID for DELETE requests
+authenticated_token_for_delete: Optional[str] = None
+authenticated_token_user_id: Optional[str] = None
+
 MAX_RETRIES = 20  # The maximum number of retries for HTTP requests
 MAX_BACKOFF_TIME = 600  # Maximum total backoff time in seconds
 HTTP_TIMEOUT = 120  # HTTP timeout in seconds (2 minutes)
@@ -182,22 +186,6 @@ def logout(client: httpx.Client, base_url: str, auth_token: str) -> None:
         logger.info("Successfully logged out from Emby server.")
     except Exception as e:
         logger.error(f"Failed to log out from Emby server: {e}")
-        # In the main() function, near the start after validating required arguments:
-
-        # Retrieve auth variables
-        env_username = get_env_variable(ENV_DEDUPE_EMBY_USERNAME)
-        env_password = get_env_variable(ENV_DEDUPE_EMBY_PASSWORD)
-
-        # Validate auth arguments
-        if not env_username or not env_password:
-            logger.error(
-                "Emby authentication credentials USERNAME and PASSWORD are required."
-            )
-            sys.exit(1)
-
-        # Authenticate and set auth token
-        auth_token = get_auth_token(client, base_url, env_username, env_password)
-        client.headers.update({"X-Emby-Token": auth_token})
 
 
 def create_http_client(base_url: str, username: str, password: str) -> httpx.Client:
@@ -358,8 +346,9 @@ def validate_required_arguments(
     host: Optional[str],
     api_key: Optional[str],
     library: Optional[str],
-    username: Optional[str],
-    password: Optional[str],
+    doit: bool,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
 ):
     """Validate that required arguments are provided.
 
@@ -367,8 +356,9 @@ def validate_required_arguments(
         host (Optional[str]): The host of the Emby server.
         api_key (Optional[str]): The API key for the Emby server.
         library (Optional[str]): The library to scan for duplicates.
-        username (Optional[str]): The username to use for authentication.
-        password (Optional[str]): The password to use for authentication.
+        doit (bool): True if the script will perform deletions.
+        username (Optional[str], optional): The username to use for authentication. Defaults to None.
+        password (Optional[str], optional): The password to use for authentication. Defaults to None.
     """
     missing_args = []
 
@@ -376,17 +366,61 @@ def validate_required_arguments(
         "host": host,
         "api-key": api_key,
         "library": library,
-        "username": username,
-        "password": password,
     }.items():
         if not value:
             missing_args.append(arg)
 
+    # Check for username and password if deletions will be performed
+    if doit:
+        if not username:
+            missing_args.append("username")
+        if not password:
+            missing_args.append("password")
+
     if missing_args:
         missing_args_str = ", ".join(missing_args)
-        print(f"Error: Missing required arguments: {missing_args_str}")
-        print("Use -h for help.")
+        logger.error(f"Error: Missing required arguments: {missing_args_str}")
+        logger.error("Use -h for help.")
         sys.exit(1)
+
+
+def ensure_authenticated_for_delete(
+    client: httpx.Client, base_url: str, username: str, password: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Ensures the user is authenticated for DELETE operations. Will authenticate the user if it's the
+    first time a DELETE operation is being attempted and will cache the token for future calls.
+
+    Args:
+        client (httpx.Client): The httpx client for making requests.
+        base_url (str): The base URL of the Emby server.
+        username (str): The username for authentication.
+        password (str): The password for authentication.
+
+    Returns:
+        Tuple[Optional[str], Optional[str]]: The authentication token and user_id if authenticated, None otherwise.
+    """
+    global authenticated_token_for_delete
+    global authenticated_token_user_id
+
+    # Check if we're already authenticated for DELETE operations
+    if authenticated_token_for_delete is not None:
+        return authenticated_token_for_delete, authenticated_token_user_id
+
+    try:
+        # Authenticate and save the token for future DELETE operations
+        authenticated_token_for_delete, authenticated_token_user_id = get_auth_token(
+            client, base_url, username, password
+        )
+        logger.info("Authenticated for DELETE operations.")
+    except EmbyServerConnectionError as e:
+        logger.error(f"Failed to authenticate for DELETE operations: {str(e)}")
+        authenticated_token_for_delete = (
+            None  # Ensure we don't attempt to authenticate again
+        )
+        authenticated_token_user_id = None
+
+    return authenticated_token_for_delete, authenticated_token_user_id
 
 
 def handle_host_and_port(host: str, arg_port: Optional[int]) -> Tuple[str, int]:
@@ -603,31 +637,30 @@ def get_library_id(
 
 def dump_object_to_file(obj: Any, base_filename: str) -> None:
     """
-    Attempts to serialize and save an object to a file. It saves objects as:
+    Attempts to serialize and save an object to a file with the specified base filename.
+    The base filename can include a relative or absolute path. The directory will be created
+    if it doesn't exist. It saves objects as:
         - Pretty JSON if the object is a dictionary or list.
         - Plain text if it's a string.
         - Binary if the object is bytes.
 
     Args:
         obj (Any): The object to be saved to a file.
-        base_filename (str): The base name for the file to save to (without an extension).
+        base_filename (str): The base name for the file to save to, which can include a path.
 
     Raises:
         ValueError: If the object type cannot be determined or handled by the function.
     """
-    # Ensure that the 'dump' subdirectory exists
-    directory = os.path.join("dump")
-    if not os.path.exists(directory):
-        try:
-            os.makedirs(directory)
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
+    # Extract directory path from base filename
+    directory = os.path.dirname(base_filename)
+    if directory:  # If the path is not empty
+        # Ensure that the directory exists
+        os.makedirs(directory, exist_ok=True)
 
     # Construct full file paths with appropriate extension
-    json_path = os.path.join(directory, f"{base_filename}.json")
-    text_path = os.path.join(directory, f"{base_filename}.txt")
-    bin_path = os.path.join(directory, f"{base_filename}.bin")
+    json_path = f"{base_filename}.json"
+    text_path = f"{base_filename}.txt"
+    bin_path = f"{base_filename}.bin"
 
     # Check if the object is serializable to JSON (dict or list)
     if isinstance(obj, (dict, list)):
@@ -880,7 +913,15 @@ def process_duplicate_groups(
     return decisions
 
 
-def delete_item(client: httpx.Client, base_url: str, item_id: str, doit: bool) -> dict:
+def delete_item(
+    client: httpx.Client,
+    base_url: str,
+    item_id: str,
+    doit: bool,
+    username: str,
+    password: str,
+    api_key: str,
+) -> dict:
     """
     Attempts to delete a media item by its ID if the 'doit' flag is True.
 
@@ -889,15 +930,29 @@ def delete_item(client: httpx.Client, base_url: str, item_id: str, doit: bool) -
         base_url (str): The base URL of the Emby server.
         item_id (str): The ID of the media item to be deleted.
         doit (bool): If True, actually performs the delete action, otherwise just simulates it.
+        username (str): The username for authentication.
+        password (str): The password for authentication.
+        api_key (str): The API key for non-DELETE requests.
 
     Returns:
         dict: The deletion status and any error message if the deletion failed.
     """
     deletion_status = {"id": item_id, "status": "not_attempted", "error": None}
     if doit:
+        # Ensure authentication is in place for DELETE operations
+        auth_token, user_id = ensure_authenticated_for_delete(
+            client, base_url, username, password
+        )
+        if auth_token is None:
+            deletion_status["status"] = "failed"
+            deletion_status[
+                "error"
+            ] = "Authentication failed; cannot perform delete operations."
+            return deletion_status
+
+        client.headers.update({"X-Emby-Token": auth_token})
         url = f"{base_url}/Items/{item_id}"
         try:
-            # Use the global HTTP_TIMEOUT constant
             response = make_http_request(client, "DELETE", url, timeout=HTTP_TIMEOUT)
             if response.is_success:
                 deletion_status["status"] = "success"
@@ -917,6 +972,9 @@ def delete_item(client: httpx.Client, base_url: str, item_id: str, doit: bool) -
             logger.error(f"Exception occurred during deletion of item {item_id}: {e}")
     else:
         deletion_status["status"] = "skipped"
+
+    # Restore the API key for the next non-DELETE request
+    client.headers.update({"X-Emby-Token": api_key})
 
     return deletion_status
 
@@ -1030,7 +1088,13 @@ def format_markdown_table(base_url: str, decisions: list) -> str:
 
 
 def process_deletion_and_generate_report(
-    client: httpx.Client, base_url: str, decisions: list, doit: bool
+    client: httpx.Client,
+    base_url: str,
+    decisions: list,
+    doit: bool,
+    username: str,
+    password: str,
+    api_key: str,
 ) -> str:
     """
     Processes deletions based on the decisions and generates a markdown report.
@@ -1041,6 +1105,9 @@ def process_deletion_and_generate_report(
         base_url (str): The base URL of the Emby server.
         decisions (list): A list of decision objects containing items to keep and delete.
         doit (bool): If True, the deletion process will be attempted; otherwise, it is only simulated.
+        username (str): The username for authentication.
+        password (str): The password for authentication.
+        api_key (str): The API key for non-DELETE requests.
 
     Returns:
         str: The generated markdown report.
@@ -1054,7 +1121,9 @@ def process_deletion_and_generate_report(
     # Process deletions and update decisions with deletion results
     for decision in decisions:
         for item in decision["delete"]:
-            item["deletion_result"] = delete_item(client, base_url, item["id"], doit)
+            item["deletion_result"] = delete_item(
+                client, base_url, item["id"], doit, username, password, api_key
+            )
             deletion_progress_bar.update(1)  # Update progress bar after each deletion
 
     # Close progress bar after deletion process is complete
@@ -1092,8 +1161,6 @@ def main():
     env_api_key = get_env_variable(ENV_DEDUPE_EMBY_API_KEY)
     env_library = get_env_variable(ENV_DEDUPE_EMBY_LIBRARY)
     env_doit = get_env_variable(ENV_DEDUPE_DOIT) in ("true", "True", "TRUE", "1")
-    env_username = get_env_variable(ENV_DEDUPE_EMBY_USERNAME)
-    env_password = get_env_variable(ENV_DEDUPE_EMBY_PASSWORD)
 
     # Set logging verbosity
     set_logging_level(args.verbosity, env_verbosity)
@@ -1106,8 +1173,6 @@ def main():
     override_warning("--port", args.port and str(args.port), env_port)
     override_warning("--api-key", args.api_key, env_api_key)
     override_warning("--library", args.library, env_library)
-    override_warning("--username", args.username, env_username)
-    override_warning("--password", args.password, env_password)
 
     # Final values with command-line arguments taking precedence over environment variables
     logger.debug("Collecting final values for required settings")
@@ -1116,11 +1181,16 @@ def main():
     api_key = args.api_key or env_api_key
     library = args.library or env_library
     doit = args.doit or env_doit
-    username = args.username or env_username
-    password = args.password or env_password
+
+    # If 'doit' is set, retrieve username and password, otherwise set as None
+    username = None
+    password = None
+    if doit:
+        username = args.username or get_env_variable(ENV_DEDUPE_EMBY_USERNAME)
+        password = args.password or get_env_variable(ENV_DEDUPE_EMBY_PASSWORD)
 
     # Validate required arguments
-    validate_required_arguments(host, api_key, library, username, password)
+    validate_required_arguments(host, api_key, library, doit, username, password)
 
     # Validate and handle host and port information
     validated_host, validated_port = handle_host_and_port(host, port)
@@ -1135,10 +1205,8 @@ def main():
         # Determine the base URL, using HTTPS if the validated port is 443
         base_url = f"{validated_host}:{validated_port}"
 
-        # Create an authenticated HTTP client
-        client, auth_token, user_id = create_http_client(
-            base_url, env_username, env_password
-        )
+        # Create an httpx client. For non-DELETE methods, we use the API key.
+        client = httpx.Client(headers={"X-Emby-Token": api_key})
 
         # Check connection to Emby server
         connection_url = f"{base_url}/System/Info"
@@ -1184,7 +1252,7 @@ def main():
         # decisions = read_json_file("testing/decisions.json")
 
         markdown_report = process_deletion_and_generate_report(
-            client, base_url, decisions, doit
+            client, base_url, decisions, doit, username, password, api_key
         )
 
         # Dump deletion results to file
@@ -1202,7 +1270,9 @@ def main():
         logger.error(str(e))
         sys.exit(1)
     finally:
-        logout(client, base_url, auth_token)
+        # Only attempt to log out if authentication for DELETE requests was successful
+        if authenticated_token_for_delete and doit:
+            logout(client, base_url, authenticated_token_for_delete)
 
 
 if __name__ == "__main__":
