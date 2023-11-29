@@ -150,7 +150,7 @@ def get_auth_token(
         response.raise_for_status()
         response_data = response.json()
         access_token = response_data.get("AccessToken")
-        user_id = response_data.get("User").get("Id")
+        user_id = response_data.get("User", {}).get("Id")
         if not access_token or not user_id:
             raise EmbyServerConnectionError(
                 "Failed to retrieve access token or user ID from Emby server."
@@ -182,10 +182,22 @@ def logout(client: httpx.Client, base_url: str, auth_token: str) -> None:
     }
 
     try:
-        client.post(logout_url, headers=headers)
+        response = client.post(logout_url, headers=headers)
+        response.raise_for_status()  # This will raise an HTTPError if the logout was unsuccessful.
         logger.info("Successfully logged out from Emby server.")
-    except Exception as e:
-        logger.error(f"Failed to log out from Emby server: {e}")
+    except httpx.HTTPStatusError as e:
+        # Handle cases where the HTTP response status indicates an error
+        logger.error(f"Failed to log out due to an HTTP error: {str(e)}")
+    except httpx.RequestError as e:
+        # Handle cases where the HTTP request itself failed
+        logger.error(f"Failed to log out due to a network error: {str(e)}")
+    except httpx.TimeoutException as e:
+        # Handle cases where the request timed out
+        logger.error(f"Failed to log out due to a timeout: {str(e)}")
+    except Exception as ex:
+        # This is a catch-all for any other exceptions, which are not expected, but
+        # provides a fail-safe to ensure the application does not crash.
+        logger.error(f"An unexpected error occurred during logout: {str(ex)}")
 
 
 def create_http_client(base_url: str, username: str, password: str) -> httpx.Client:
@@ -724,30 +736,54 @@ def get_quality_description(item):
         item (dict): A media item containing MediaStreams.
 
     Returns:
-        dict: A description of the quality of the given media item.
+        dict: A description of the quality of the given media item,
+              or empty if critical details are missing.
     """
+    # Check for 'MediaStreams' presence before continuing
+    if "MediaStreams" not in item:
+        logger.warning(
+            f"Item ID {item.get('Id', 'unknown')} does not have 'MediaStreams'."
+        )
+        return {}
+
+    # Safe extraction of streams
     video_stream = next((s for s in item["MediaStreams"] if s["Type"] == "Video"), None)
     audio_stream = next((s for s in item["MediaStreams"] if s["Type"] == "Audio"), None)
 
-    return {
+    # Construct the quality description safely
+    quality_description = {
         "video": {
-            "codec": video_stream.get("Codec") if video_stream else "unknown",
-            "resolution": video_stream.get("DisplayTitle")
+            "codec": video_stream.get("Codec", "unknown")
             if video_stream
             else "unknown",
-            "bitrate": video_stream.get("BitRate") if video_stream else "unknown",
-            "bitdepth": video_stream.get("BitDepth") if video_stream else "unknown",
-            "interlaced": video_stream.get("IsInterlaced")
+            "resolution": video_stream.get("DisplayTitle", "unknown")
+            if video_stream
+            else "unknown",
+            "bitrate": video_stream.get("BitRate", "unknown")
+            if video_stream
+            else "unknown",
+            "bitdepth": video_stream.get("BitDepth", "unknown")
+            if video_stream
+            else "unknown",
+            "interlaced": video_stream.get("IsInterlaced", "unknown")
             if video_stream
             else "unknown",
         },
         "audio": {
-            "codec": audio_stream.get("Codec") if audio_stream else "unknown",
-            "channels": audio_stream.get("Channels") if audio_stream else "unknown",
-            "bitrate": audio_stream.get("BitRate") if audio_stream else "unknown",
+            "codec": audio_stream.get("Codec", "unknown")
+            if audio_stream
+            else "unknown",
+            "channels": audio_stream.get("Channels", "unknown")
+            if audio_stream
+            else "unknown",
+            "bitrate": audio_stream.get("BitRate", "unknown")
+            if audio_stream
+            else "unknown",
         },
-        "size": item.get("Size"),
+        "size": item.get("Size", "unknown"),
     }
+
+    return quality_description
 
 
 def rationalize_duplicates(media_items_by_provider):
