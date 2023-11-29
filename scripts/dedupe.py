@@ -1292,8 +1292,6 @@ def main():
             logging.DEBUG
         ) else None
 
-        # decisions = read_json_file("testing/decisions.json")
-
         markdown_report = process_deletion_and_generate_report(
             client, base_url, decisions, doit, username, password, api_key
         )
@@ -1311,6 +1309,16 @@ def main():
 
     except EmbyServerConnectionError as e:
         logger.error(str(e))
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode JSON: {str(e)}")
+        sys.exit(1)
+    except httpx.TimeoutException as e:
+        logger.error(f"HTTP request timed out: {str(e)}")
+        sys.exit(1)
+    except Exception as e:
+        # Catch-all for any other unexpected exceptions
+        logger.error(f"An unexpected error occurred: {str(e)}")
         sys.exit(1)
     finally:
         # Only attempt to log out if authentication for DELETE requests was successful
