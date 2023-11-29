@@ -28,7 +28,7 @@ The following architectures are supported in the latest version:
 - [Usage](#usage)
 - [Environment Variables](#environment-variables)
 - [Examples](#examples)
-- [Note on API Key](#note-on-api-key)
+- [API Key Requirement](#api-key-requirement)
 - [Acknowledgments](#acknowledgments)
 - [Contributing](#contributing)
 - [License](#license)
@@ -38,7 +38,7 @@ The following architectures are supported in the latest version:
 Before using this container, you should have:
 
 - Docker installed on your machine.
-- Access to an Emby server with a username and password.
+- Access to an Emby server with an API key.
 
 ## Installation
 
@@ -61,11 +61,11 @@ The following variables are used to run the script:
 - `DEDUPE_EMBY_HOST`: The hostname or IP of the Emby server.
 - `DEDUPE_EMBY_PORT`: The port for the Emby server (defaults to 8096 if not specified).
 - `DEDUPE_EMBY_LIBRARY`: The name of the library on the Emby server you want to deduplicate.
-- `DEDUPE_EMBY_USERNAME`: Emby username for server access.
-- `DEDUPE_EMBY_PASSWORD`: Emby password for server access.
-- `DEDUPE_EMBY_API_KEY`: A placeholder for an API key; currently, any non-empty value will suffice.
-- `DEDUPE_DOIT`: Set to 'true' to perform deduplication deletion actions (defaults to 'false').
+- `DEDUPE_EMBY_API_KEY`: The API key for the Emby server with appropriate permissions.
+- `DEDUPE_DOIT`: Set to 'true' to perform deduplication deletion actions. Requires Emby username and password (defaults to 'false').
 - `DEDUPE_LOGGING`: The logging level (e.g., ERROR, WARNING, INFO, DEBUG), affecting verbosity.
+- `DEDUPE_EMBY_USERNAME`: Emby username for server access, required if `DEDUPE_DOIT` is 'true'.
+- `DEDUPE_EMBY_PASSWORD`: Emby password for server access, required if `DEDUPE_DOIT` is 'true'.
 
 ## Examples
 
@@ -77,34 +77,28 @@ The following command simulates the deduplication process to provide a list of p
 docker run \
   -e DEDUPE_EMBY_HOST="http://your-emby-server" \
   -e DEDUPE_EMBY_LIBRARY="Your Library Name" \
-  -e DEDUPE_EMBY_USERNAME="your_emby_username" \
-  -e DEDUPE_EMBY_PASSWORD="your_emby_password" \
-  -e DEDUPE_EMBY_API_KEY="notused" \
+  -e DEDUPE_EMBY_API_KEY="your_api_key" \
   ghcr.io/troykelly/emby-dedupe
 ```
 
 ### Performing Deduplication Actions
 
-To perform the deletion of duplicates based on the script's output:
+To perform the deletion of duplicates based on the script's output, provide the username and password in addition to other environment variables set earlier:
 
 ```shell
 docker run \
   -e DEDUPE_EMBY_HOST="http://your-emby-server" \
   -e DEDUPE_EMBY_LIBRARY="Your Library Name" \
+  -e DEDUPE_EMBY_API_KEY="your_api_key" \
   -e DEDUPE_EMBY_USERNAME="your_emby_username" \
   -e DEDUPE_EMBY_PASSWORD="your_emby_password" \
-  -e DEDUPE_EMBY_API_KEY="notused" \
   -e DEDUPE_DOIT="true" \
   ghcr.io/troykelly/emby-dedupe
 ```
 
-## Note on API Key
+## API Key Requirement
 
-The code currently contains a placeholder for an Emby API key. While the API key is required to be passed as an environment variable, it does not need to be valid, as it is not used in the current operation of this script. This will be addressed and potentially removed in future updates, transitioning to a more secure method of authentication.
-
-## Acknowledgments
-
-This project is possible thanks to the Emby media server and the Python libraries enabling easy HTTP communications and multi-threaded operations.
+A valid API key with enough permissions to access the necessary operations on the Emby server must be provided. This API key is used to authenticate the script with the Emby server for read and list actions. Deletion operations require username and password credentials for additional authentication.
 
 ## Contributing
 
