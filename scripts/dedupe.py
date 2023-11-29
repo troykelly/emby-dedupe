@@ -150,7 +150,7 @@ def get_auth_token(
         response.raise_for_status()
         response_data = response.json()
         access_token = response_data.get("AccessToken")
-        user_id = response_data.get("User").get("Id")
+        user_id = response_data.get("User", {}).get("Id")
         if not access_token or not user_id:
             raise EmbyServerConnectionError(
                 "Failed to retrieve access token or user ID from Emby server."
@@ -182,10 +182,22 @@ def logout(client: httpx.Client, base_url: str, auth_token: str) -> None:
     }
 
     try:
-        client.post(logout_url, headers=headers)
+        response = client.post(logout_url, headers=headers)
+        response.raise_for_status()  # This will raise an HTTPError if the logout was unsuccessful.
         logger.info("Successfully logged out from Emby server.")
-    except Exception as e:
-        logger.error(f"Failed to log out from Emby server: {e}")
+    except httpx.HTTPStatusError as e:
+        # Handle cases where the HTTP response status indicates an error
+        logger.error(f"Failed to log out due to an HTTP error: {str(e)}")
+    except httpx.RequestError as e:
+        # Handle cases where the HTTP request itself failed
+        logger.error(f"Failed to log out due to a network error: {str(e)}")
+    except httpx.TimeoutException as e:
+        # Handle cases where the request timed out
+        logger.error(f"Failed to log out due to a timeout: {str(e)}")
+    except Exception as ex:
+        # This is a catch-all for any other exceptions, which are not expected, but
+        # provides a fail-safe to ensure the application does not crash.
+        logger.error(f"An unexpected error occurred during logout: {str(ex)}")
 
 
 def create_http_client(base_url: str, username: str, password: str) -> httpx.Client:
@@ -724,30 +736,54 @@ def get_quality_description(item):
         item (dict): A media item containing MediaStreams.
 
     Returns:
-        dict: A description of the quality of the given media item.
+        dict: A description of the quality of the given media item,
+              or empty if critical details are missing.
     """
+    # Check for 'MediaStreams' presence before continuing
+    if "MediaStreams" not in item:
+        logger.warning(
+            f"Item ID {item.get('Id', 'unknown')} does not have 'MediaStreams'."
+        )
+        return {}
+
+    # Safe extraction of streams
     video_stream = next((s for s in item["MediaStreams"] if s["Type"] == "Video"), None)
     audio_stream = next((s for s in item["MediaStreams"] if s["Type"] == "Audio"), None)
 
-    return {
+    # Construct the quality description safely
+    quality_description = {
         "video": {
-            "codec": video_stream.get("Codec") if video_stream else "unknown",
-            "resolution": video_stream.get("DisplayTitle")
+            "codec": video_stream.get("Codec", "unknown")
             if video_stream
             else "unknown",
-            "bitrate": video_stream.get("BitRate") if video_stream else "unknown",
-            "bitdepth": video_stream.get("BitDepth") if video_stream else "unknown",
-            "interlaced": video_stream.get("IsInterlaced")
+            "resolution": video_stream.get("DisplayTitle", "unknown")
+            if video_stream
+            else "unknown",
+            "bitrate": video_stream.get("BitRate", "unknown")
+            if video_stream
+            else "unknown",
+            "bitdepth": video_stream.get("BitDepth", "unknown")
+            if video_stream
+            else "unknown",
+            "interlaced": video_stream.get("IsInterlaced", "unknown")
             if video_stream
             else "unknown",
         },
         "audio": {
-            "codec": audio_stream.get("Codec") if audio_stream else "unknown",
-            "channels": audio_stream.get("Channels") if audio_stream else "unknown",
-            "bitrate": audio_stream.get("BitRate") if audio_stream else "unknown",
+            "codec": audio_stream.get("Codec", "unknown")
+            if audio_stream
+            else "unknown",
+            "channels": audio_stream.get("Channels", "unknown")
+            if audio_stream
+            else "unknown",
+            "bitrate": audio_stream.get("BitRate", "unknown")
+            if audio_stream
+            else "unknown",
         },
-        "size": item.get("Size"),
+        "size": item.get("Size", "unknown"),
     }
+
+    return quality_description
 
 
 def rationalize_duplicates(media_items_by_provider):
@@ -835,6 +871,13 @@ def rate_media_items(items):
     """
     rated_items = []
     for item in items:
+        # Skip items with no 'MediaStreams' key
+        if "MediaStreams" not in item:
+            logger.warning(
+                f"Media item {item.get('Id', 'unknown')} has no 'MediaStreams' entry; skipping."
+            )
+            continue
+
         video_stream = next(
             (s for s in item["MediaStreams"] if s["Type"] == "Video"), None
         )
@@ -868,12 +911,12 @@ def rate_media_items(items):
             {
                 "id": item["Id"],
                 "name": item["Name"],
-                "path": item["Path"],
-                "serverid": item["ServerId"],
+                "path": item.get("Path"),
+                "serverid": item.get("ServerId"),
                 "rating": quality_rating,
-                "quality_description": get_quality_description(
-                    item
-                ),  # function to extract quality description from item
+                "quality_description": get_quality_description(item)
+                if video_stream and audio_stream
+                else {},  # Only attempt this if streams are present
             }
         )
 
@@ -1249,8 +1292,6 @@ def main():
             logging.DEBUG
         ) else None
 
-        # decisions = read_json_file("testing/decisions.json")
-
         markdown_report = process_deletion_and_generate_report(
             client, base_url, decisions, doit, username, password, api_key
         )
@@ -1268,6 +1309,16 @@ def main():
 
     except EmbyServerConnectionError as e:
         logger.error(str(e))
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode JSON: {str(e)}")
+        sys.exit(1)
+    except httpx.TimeoutException as e:
+        logger.error(f"HTTP request timed out: {str(e)}")
+        sys.exit(1)
+    except Exception as e:
+        # Catch-all for any other unexpected exceptions
+        logger.error(f"An unexpected error occurred: {str(e)}")
         sys.exit(1)
     finally:
         # Only attempt to log out if authentication for DELETE requests was successful
