@@ -835,6 +835,13 @@ def rate_media_items(items):
     """
     rated_items = []
     for item in items:
+        # Skip items with no 'MediaStreams' key
+        if "MediaStreams" not in item:
+            logger.warning(
+                f"Media item {item.get('Id', 'unknown')} has no 'MediaStreams' entry; skipping."
+            )
+            continue
+
         video_stream = next(
             (s for s in item["MediaStreams"] if s["Type"] == "Video"), None
         )
@@ -868,12 +875,12 @@ def rate_media_items(items):
             {
                 "id": item["Id"],
                 "name": item["Name"],
-                "path": item["Path"],
-                "serverid": item["ServerId"],
+                "path": item.get("Path"),
+                "serverid": item.get("ServerId"),
                 "rating": quality_rating,
-                "quality_description": get_quality_description(
-                    item
-                ),  # function to extract quality description from item
+                "quality_description": get_quality_description(item)
+                if video_stream and audio_stream
+                else {},  # Only attempt this if streams are present
             }
         )
 
