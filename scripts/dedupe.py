@@ -904,7 +904,9 @@ def fetch_items_details(client: httpx.Client, base_url: str, item_ids: list) -> 
 def determine_items_to_delete(duplicate_ids: list, all_items_details: list) -> dict:
     """
     Determines the best quality media item to keep and marks the rest for deletion.
-    The criteria for the best quality is based on resolution, audio channels, bitrate, and file size.
+    The criteria for the best quality are based on resolution, video codec efficiency,
+    audio channels, audio codec efficiency, bitrate, and file size as well as other
+    attributes like frame rate and HDR capability.
 
     Args:
         duplicate_ids (list): A list of IDs of potentially duplicate media items.
@@ -945,15 +947,6 @@ def rate_media_items(items):
     for item in items:
         # Skip items with no 'MediaStreams' key
         if "MediaStreams" not in item:
-            logger.debug(
-                f"Media item {item.get('Id', 'unknown')} has no 'MediaStreams' entry; skipping."
-            )
-            try:
-                dump_object_to_file(
-                    item, f"testing/item_{item.get('Id', 'unknown')}"
-                ) if logger.isEnabledFor(logging.DEBUG) else None
-            except Exception as e:
-                logger.error(f"Error dumping provider tables: {e}")
             continue
 
         video_stream = next(
@@ -971,12 +964,36 @@ def rate_media_items(items):
                 else 0,
                 1,
             ),
+            "video_codec_efficiency": (
+                get_codec_efficiency(video_stream.get("Codec", "")),
+                2,
+            ),
             "audio_channels": (
                 audio_stream.get("Channels", 0) if audio_stream else 0,
-                0.5,
+                1,
             ),
-            "bitrate": (item.get("Bitrate", 0), 0.2),
-            "file_size": (item.get("Size", 0), 0.3),
+            "audio_codec_efficiency": (
+                get_codec_efficiency(audio_stream.get("Codec", "")),
+                1,
+            ),
+            "bitrate": (
+                item.get("Bitrate", 0)
+                + (audio_stream.get("BitRate", 0) if audio_stream else 0),
+                1,
+            ),
+            "file_size": (
+                item.get("Size", 0),
+                -0.5,  # A smaller weight as bigger size doesn't always mean better quality.
+            ),
+            "frame_rate": (
+                get_frame_rate(video_stream),
+                0.5,  # A slight weight to encourage higher frame rates.
+            ),
+            "hdr": (
+                1 if "hdr" in video_stream.get("VideoRange", "").lower() else 0,
+                0.2,  # A small weight for HDR content.
+            ),
+            # Add other factors like subtitles and language tracks as needed.
         }
 
         # Calculate the weighted quality rating
@@ -989,16 +1006,92 @@ def rate_media_items(items):
             {
                 "id": item["Id"],
                 "name": item["Name"],
-                "path": item.get("Path"),
-                "serverid": item.get("ServerId"),
+                "path": item.get("Path", "Unknown"),
                 "rating": quality_rating,
-                "quality_description": get_quality_description(item)
-                if video_stream and audio_stream
-                else {},  # Only attempt this if streams are present
+                "quality_description": {
+                    "resolution": f"{video_stream.get('Width')}x{video_stream.get('Height')}"
+                    if video_stream
+                    else "Unknown",
+                    "video_codec": video_stream.get("Codec", "Unknown")
+                    if video_stream
+                    else "Unknown",
+                    "audio_channels": audio_stream.get("Channels", "Unknown")
+                    if audio_stream
+                    else "Unknown",
+                    "audio_codec": audio_stream.get("Codec", "Unknown")
+                    if audio_stream
+                    else "Unknown",
+                    "video_bitrate": f"{video_stream.get('BitRate', 'Unknown')} kbps"
+                    if video_stream
+                    else "Unknown",
+                    "audio_bitrate": f"{audio_stream.get('BitRate', 'Unknown')} kbps"
+                    if audio_stream
+                    else "Unknown",
+                    "frame_rate": f"{get_frame_rate(video_stream)} fps"
+                    if video_stream
+                    else "Unknown",
+                    "hdr": "Yes"
+                    if "hdr" in video_stream.get("VideoRange", "").lower()
+                    else "No"
+                    if video_stream
+                    else "Unknown",
+                    "file_size": f"{item.get('Size', 'Unknown')} bytes",
+                    # Include additional details as necessary
+                },
             }
         )
 
     return rated_items
+
+
+def get_codec_efficiency(codec: str) -> float:
+    """
+    Assigns an efficiency score to a given video/audio codec.
+
+    Video codecs are rated based on their compression efficiency and quality deliverance,
+    whereas audio codecs are rated on their audio reproduction quality and compression ratio.
+
+    Args:
+        codec (str): The codec identifier (e.g. 'h264', 'hevc', 'aac', etc.).
+
+    Returns:
+        float: A numeric score representing the codec's relative efficiency.
+    """
+    codec_efficiency = {
+        "h264": 1.0,
+        "hevc": 1.5,  # HEVC/H.265 is more efficient than H.264
+        "vp9": 1.4,
+        "av1": 1.6,
+        "aac": 1.0,
+        "ac3": 1.1,
+        "eac3": 1.3,
+        "dts": 1.2,
+        "truehd": 1.4,
+        # Add more codecs as needed.
+    }
+    # Fallback to a default value if codec not listed
+    return codec_efficiency.get(codec.lower(), 0.8)
+
+
+def get_frame_rate(video_stream: dict) -> float:
+    """
+    Extracts the frame rate from a video stream's information.
+
+    Looks for 'AverageFrameRate' or 'RealFrameRate' within a video stream's
+    attributes and returns that value. If neither exists, it defaults to a
+    commonly used frame rate.
+
+    Args:
+        video_stream (dict): A dictionary containing the video stream's attributes.
+
+    Returns:
+        float: The extracted frame rate, or a common default frame rate if unspecified.
+    """
+    if video_stream and "AverageFrameRate" in video_stream:
+        return float(video_stream["AverageFrameRate"])
+    if video_stream and "RealFrameRate" in video_stream:
+        return float(video_stream["RealFrameRate"])
+    return 24.0  # A common default frame rate if none specified.
 
 
 def process_duplicate_groups(
