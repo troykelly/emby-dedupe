@@ -640,7 +640,7 @@ def fetch_and_process_media_items(
     try:
         # Continue fetching until all pages are processed
         while start_index < total_items:
-            url = f"{base_url}/Items?StartIndex={start_index}&Limit={page_size}&Recursive=True&ParentId={library_id}&Fields=ProviderIds&Is3D=False"
+            url = f"{base_url}/Items?StartIndex={start_index}&Limit={page_size}&Recursive=True&ParentId={library_id}&Fields=ProviderIds&Is3D=False&IsFolder=False"
             try:
                 response = make_http_request(client, "GET", url)
                 media_items = response.json().get("Items", [])
