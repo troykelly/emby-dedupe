@@ -100,6 +100,24 @@ docker run \
 
 A valid API key with enough permissions to access the necessary operations on the Emby server must be provided. This API key is used to authenticate the script with the Emby server for read and list actions. Deletion operations require username and password credentials for additional authentication.
 
+## A Note With Regard To Folders
+
+The script will not remove duplicate folders. Folders are ignored by the script. I'm not entirely sure how to handle them, and given the purpose of the script is to recover disk space, the benefit of a lot of additional logic to check if a folder is empty is yet to present itself. I'm happy to be swayed otherwise, please reach out if you think there's a need for this.
+
+You can (and probably will) end up with empty folders, especially if you keep all your movies in folders.
+
+I'd suggest something like:
+
+```bash
+MY_MEDIA=/data/Movies; find "$MY_MEDIA" -type d -empty
+```
+
+and if you are happy with that... (NOTE: This _will_ remove empty folders - you've been warned)
+
+```bash
+MY_MEDIA=/data/Movies; find "$MY_MEDIA" -type d -empty -delete
+```
+
 ## Contributing
 
 We welcome your contributions. If you encounter bugs or have suggestions for improvement, please feel free to open an issue on the [GitHub repository](https://github.com/troykelly/emby-dedupe). Pull requests are also greatly appreciated.
