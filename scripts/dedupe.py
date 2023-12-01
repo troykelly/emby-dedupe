@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os
+import io
 import sys
 import logging
 import argparse
@@ -14,6 +15,7 @@ from typing import Any
 import backoff
 import hashlib
 import errno
+import re
 from httpx import HTTPStatusError, ReadTimeout, RequestError
 
 # At the top of your script, after the imports, establish a logger for the tool
@@ -51,6 +53,49 @@ LOGGING_LEVELS = {
     "INFO": logging.INFO,
     "DEBUG": logging.DEBUG,
 }
+
+
+class SensitiveDataFilter(logging.Filter):
+    """
+    Log filter that redacts sensitive information in log messages such as keys or passwords.
+    """
+
+    def __init__(self, patterns: Optional[list] = None):
+        super().__init__()
+        # Add more patterns for keys or tokens that do not have a clear prefix/suffix.
+        self._patterns = patterns or [
+            re.compile(r"(?<=api_key=)[\w-]{10,}"),  # API key with prefix
+            re.compile(r"(?<=password=)[\w-]{10,}"),  # Passwords with prefix
+            re.compile(
+                r"\b[A-Z0-9]{20,}\b"
+            ),  # Matches uppercase strings of 20+ chars (possible keys or tokens)
+            re.compile(
+                r"\b[0-9a-fA-F-]{30,}\b"
+            ),  # Matches hexadecimal strings (often used in keys and tokens) of 30+ chars
+            re.compile(
+                r"\b[0-9A-Za-z_\-]{32,}\b"
+            ),  # Alphanumeric strings with underscores/dashes, 32+ chars long
+            # ... Add additional patterns as necessary
+        ]
+
+    def filter(self, record):
+        """
+        Redact sensitive information in the message before logging.
+
+        Args:
+            record (logging.LogRecord): The log record being processed.
+
+        Returns:
+            bool: True if the log record should be logged, False otherwise. This implementation
+                  always returns True as we simply want to modify the record, not reject it.
+        """
+        original = record.getMessage()
+        for pattern in self._patterns:
+            # Replace occurrences of the pattern with 'REDACTED'
+            original = pattern.sub("REDACTED", original)
+        # Set the modified message
+        record.msg = original
+        return True
 
 
 class DisjointSet:
@@ -117,6 +162,20 @@ def make_http_request(
     except (HTTPStatusError, ReadTimeout, RequestError) as exc:
         logger.warning(f"Request failed: {exc}. Retrying...")
         raise
+
+
+def truncate_string(value: str, max_length: int) -> str:
+    """
+    Truncates a string to a maximum number of characters, adding an ellipsis if needed.
+
+    Args:
+        value (str): The string to truncate.
+        max_length (int): The maximum allowed length of the string.
+
+    Returns:
+        str: The truncated string with ellipsis if the original was longer than max_length.
+    """
+    return (value[: max_length - 1] + "…") if len(value) > max_length else value
 
 
 def get_auth_token(
@@ -295,7 +354,8 @@ def build_disjoint_set(media_items_by_provider):
 
 
 def set_logging_level(verbosity_count: int, env_verbosity: Optional[str]) -> None:
-    """Set logging level based on verbosity count and environment variable.
+    """
+    Set logging level based on verbosity count and environment variable.
 
     Args:
         verbosity_count (int): Count of verbose flags (-v) in the command line.
@@ -311,6 +371,14 @@ def set_logging_level(verbosity_count: int, env_verbosity: Optional[str]) -> Non
     # Set the level for the tool's logger instead of the root logger
     logger.setLevel(level)
 
+    # Create a log filter and formatter
+    sensitive_data_filter = SensitiveDataFilter()
+    logger.addFilter(sensitive_data_filter)  # Add the custom filter to the logger
+
+    # To avoid duplicate logging if the function is called multiple times, clear any previously added handlers
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
     # Configure a console handler for the tool's logger
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
@@ -318,10 +386,6 @@ def set_logging_level(verbosity_count: int, env_verbosity: Optional[str]) -> Non
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    # To avoid duplicate logging if function is called multiple times, clear any previously added handlers
-    logger.handlers.clear()
     logger.addHandler(console_handler)
 
     logger.info(f"Logging level set to {logging.getLevelName(level)}")
@@ -520,6 +584,9 @@ def build_provider_id_tables(media_items: list, provider_tables: dict):
     IGNORED_IMDB_ID = "tt0000000"  # IMDb ID to ignore
 
     for item in media_items:
+        # Check the item is not a folder
+        if item.get("IsFolder") and item.get("IsFolder") == True:
+            continue
         provider_ids = item.get("ProviderIds", {})
         for provider, table_name in [
             ("Imdb", "imdb"),
@@ -558,7 +625,7 @@ def fetch_and_process_media_items(
     provider_tables = {"imdb": {}, "tvdb": {}, "tmdb": {}}
 
     # Fetch the total number of items
-    url = f"{base_url}/Items?StartIndex=0&Limit=0&Recursive=True&ParentId={library_id}&Fields=ProviderIds&Is3D=False"
+    url = f"{base_url}/Items?StartIndex=0&Limit=0&Recursive=True&ParentId={library_id}&Fields=ProviderIds&Is3D=False&IsFolder=False"
     try:
         response = make_http_request(client, "GET", url)
         total_items = response.json().get("TotalRecordCount", 0)
@@ -849,6 +916,11 @@ def determine_items_to_delete(duplicate_ids: list, all_items_details: list) -> d
     # Process and rate each item based on quality factors
     rated_items = rate_media_items(all_items_details)
 
+    # If rated items is empty, return an empty decision
+    if not rated_items:
+        logger.debug(f"No rated items found for duplicate IDs: {duplicate_ids}.")
+        return {"keep": {}, "delete": []}
+
     # Sort items by their quality rating (higher is better)
     rated_items.sort(key=lambda x: x["rating"], reverse=True)
 
@@ -873,9 +945,15 @@ def rate_media_items(items):
     for item in items:
         # Skip items with no 'MediaStreams' key
         if "MediaStreams" not in item:
-            logger.warning(
+            logger.debug(
                 f"Media item {item.get('Id', 'unknown')} has no 'MediaStreams' entry; skipping."
             )
+            try:
+                dump_object_to_file(
+                    item, f"testing/item_{item.get('Id', 'unknown')}"
+                ) if logger.isEnabledFor(logging.DEBUG) else None
+            except Exception as e:
+                logger.error(f"Error dumping provider tables: {e}")
             continue
 
         video_stream = next(
@@ -947,9 +1025,14 @@ def process_duplicate_groups(
         # Fetch details for all items in the group
         items_details = fetch_items_details(client, base_url, group)
         if items_details:
-            # Determine which items to delete within this group
-            decision = determine_items_to_delete(group, items_details)
-            decisions.append(decision)
+            try:
+                # Determine which items to delete within this group
+                decision = determine_items_to_delete(group, items_details)
+                decisions.append(decision)
+            except Exception as e:
+                logger.error(f"Unable to determine items to delete: {e}")
+                logger.debug(f"group: {group}")
+                logger.debug(f"items_details: {items_details}")
         progress_bar.update(1)  # Update progress bar for each processed group
 
     progress_bar.close()  # Close progress bar after all groups have been processed
@@ -1044,90 +1127,108 @@ def format_individual_item(item, base_url, decision):
     item_link = f"[{item['id']}]({base_url}/web/index.html#!/item?id={item['id']}&serverId={decision['keep']['serverid']})"
     deletion_status = item["deletion_result"]
     status_emoji = get_emoji_for_status(deletion_status.get("status", "skipped"))
-    error_message = deletion_status.get("error", "")
-    return (
-        f"{name_match_emoji} {item_link} {item['name']}{status_emoji} {error_message}"
+    error_message = deletion_status.get("error")
+    error_message_string = (
+        f" Error: {error_message}" if error_message is not None else ""
     )
+    return f"{name_match_emoji} {item_link} {truncate_string(item['name'],10)}{status_emoji} {error_message_string}"
 
 
 def format_markdown_table(base_url: str, decisions: list) -> str:
     """
-    Formats the decisions into a markdown table.
-    This function includes a progress bar reporting for each group of duplicates as it's being formatted.
+    Efficiently formats the decisions into a markdown table.
 
     Args:
         base_url (str): The base URL of the Emby server.
         decisions (list): List of decision objects containing items to keep and delete.
 
     Returns:
-        str: A formatted markdown table as a string.
+        str: The generated markdown table as a string.
     """
+    # Store the rows as a list of dictionaries
+    table_rows = []
 
-    # Headers
+    # Initialize the progress bar
+    progress_bar_data = tqdm(
+        total=len(decisions), desc="Preparing result table", unit="row"
+    )
+
+    # Collect row entries, this is not memory-intensive
+    for decision in decisions:
+        keep = decision["keep"]
+        row = {
+            "ID": f"[{keep['id']}]({base_url}/web/index.html#!/item?id={keep['id']}&serverId={keep['serverid']})",
+            "Title": truncate_string(keep["name"], 15),
+            "Codec": keep["quality_description"]["video"]["codec"],
+            "Size": str(keep["quality_description"]["size"]),
+            "Items to Delete": "<br>".join(
+                format_individual_item(item, base_url, decision)
+                for item in decision["delete"]
+            ),
+        }
+        table_rows.append(row)
+        progress_bar_data.update(1)
+    progress_bar_data.close()
+
+    # Determine maximum column widths once all rows are built
+    max_widths = {
+        "ID": max(len(row["ID"]) for row in table_rows),
+        "Title": max(len(row["Title"]) for row in table_rows),
+        "Codec": max(len(row["Codec"]) for row in table_rows),
+        "Size": max(len(row["Size"]) for row in table_rows),
+        "Items to Delete": max(len(row["Items to Delete"]) for row in table_rows),
+    }
+
     headers = ["ID", "Title", "Codec", "Size", "Items to Delete"]
-    max_widths = {header: len(header) for header in headers}
 
-    # Determine the maximum width for each column based on content
-    for decision in decisions:
-        keep = decision["keep"]
-        max_widths["ID"] = max(max_widths["ID"], len(keep["id"]))
-        max_widths["Title"] = max(max_widths["Title"], len(keep["name"]))
-        max_widths["Codec"] = max(
-            max_widths["Codec"], len(keep["quality_description"]["video"]["codec"])
-        )
-        max_widths["Size"] = max(
-            max_widths["Size"], len(str(keep["quality_description"]["size"]))
-        )
+    # Using StringIO to efficiently build the table
+    with io.StringIO() as buffer:
+        # Log the initial memory usage of the buffer
+        initial_memory_usage = sys.getsizeof(buffer.getvalue())
 
-        deletion_entries = [
-            format_individual_item(item, base_url, decision)
-            for item in decision["delete"]
-        ]
-        max_widths["Items to Delete"] = max(
-            max_widths["Items to Delete"], max(len(entry) for entry in deletion_entries)
+        # Write header
+        buffer.write(
+            "| "
+            + " | ".join(f"{header:<{max_widths[header]}}" for header in headers)
+            + " |\n"
+        )
+        buffer.write(
+            "|-"
+            + "-|-".join(f"{'':-<{max_widths[header]}}" for header in headers)
+            + "-|\n"
         )
 
-    header_line = (
-        "| "
-        + " | ".join(f"{header:<{max_widths[header]}}" for header in headers)
-        + " |\n"
-    )
-    separator_line = (
-        "|-" + "-|-".join(f"{'':-<{max_widths[header]}}" for header in headers) + "-|\n"
-    )
-
-    # Rows
-    rows = []
-
-    # Initialize progress bar for markdown table formatting process
-    table_progress_bar = tqdm(
-        total=len(decisions), desc="Formatting markdown table", unit="group"
-    )
-
-    for decision in decisions:
-        keep = decision["keep"]
-        id_link = f"[{keep['id']}]({base_url}/web/index.html#!/item?id={keep['id']}&serverId={decision['keep']['serverid']})"
-        keep_name = keep["name"]
-        keep_codec = keep["quality_description"]["video"]["codec"]
-        keep_size = str(keep["quality_description"]["size"])
-        delete_entries = "<br>".join(
-            format_individual_item(item, base_url, decision)
-            for item in decision["delete"]
+        # Initialize the progress bar
+        progress_bar = tqdm(
+            total=len(table_rows), desc="Formatting markdown table", unit="row"
         )
-        row = (
-            f"| {id_link:<{max_widths['ID']}} "
-            f"| {keep_name:<{max_widths['Title']}} "
-            f"| {keep_codec:<{max_widths['Codec']}} "
-            f"| {keep_size:<{max_widths['Size']}} "
-            f"| {delete_entries:<{max_widths['Items to Delete']}} |\n"
-        )
-        rows.append(row)
-        table_progress_bar.update(1)
 
-    table_progress_bar.close()
+        # Must use a try to catch excessive memory usage
+        try:
+            # Write all rows and update the progress bar for each row.
+            for row in table_rows:
+                buffer.write(
+                    "| "
+                    + " | ".join(
+                        f"{str(row[header]):<{max_widths[header]}}"
+                        for header in headers
+                    )
+                    + " |\n"
+                )
+                progress_bar.update(1)
+                current_memory_usage = sys.getsizeof(buffer.getvalue())
+        except MemoryError:
+            logger.error(
+                f"Memory usage exceeded limit while formatting markdown table. "
+                f"Current usage: {current_memory_usage}"
+            )
+            progress_bar.close()
+            return ""
 
-    markdown_table = header_line + separator_line + "".join(rows)
-    return markdown_table
+        progress_bar.close()
+
+        # Retrieve the complete table as a string from the buffer
+        return buffer.getvalue()
 
 
 def process_deletion_and_generate_report(
@@ -1155,15 +1256,41 @@ def process_deletion_and_generate_report(
     Returns:
         str: The generated markdown report.
     """
-    # Initialize progress bar for deletion process
+
     total_deletions = sum(len(decision["delete"]) for decision in decisions)
+
+    if not doit:
+        # Initialize progress bar for deletion process
+        deletion_progress_bar = tqdm(
+            total=total_deletions, desc="Skipping deletion", unit="item"
+        )
+
+        for decision in decisions:
+            for item in decision["delete"]:
+                deletion_status = {
+                    "id": item["id"],
+                    "status": "not_attempted",
+                    "error": None,
+                }
+                item["deletion_result"] = deletion_status
+                deletion_progress_bar.update(
+                    1
+                )  # Update progress bar after each deletion
+
+        # Close progress bar after deletion process is complete
+        deletion_progress_bar.close()
+
+        return format_markdown_table(base_url, decisions)
+
+    # Initialize progress bar for deletion process
     deletion_progress_bar = tqdm(
-        total=total_deletions, desc="Deleting duplicate items", unit="item"
+        total=total_deletions, desc="Deleting items", unit="item", dynamic_ncols=True
     )
 
     # Process deletions and update decisions with deletion results
     for decision in decisions:
         for item in decision["delete"]:
+            deletion_progress_bar.set_description(f"Deleting ID: {item['id']}")
             item["deletion_result"] = delete_item(
                 client, base_url, item["id"], doit, username, password, api_key
             )
@@ -1285,12 +1412,18 @@ def main():
             logging.DEBUG
         ) else None
 
+        # # Testing - Fetch from JSON
+        # duplicates = read_json_file("testing/aggregate.json")
+
         decisions = process_duplicate_groups(client, base_url, duplicates)
 
         # Dump decisions to files
         dump_object_to_file(decisions, "testing/decisions") if logger.isEnabledFor(
             logging.DEBUG
         ) else None
+
+        # # Testing - Fetch from JSON
+        # decisions = read_json_file("testing/decisions.json")
 
         markdown_report = process_deletion_and_generate_report(
             client, base_url, decisions, doit, username, password, api_key
@@ -1319,6 +1452,7 @@ def main():
     except Exception as e:
         # Catch-all for any other unexpected exceptions
         logger.error(f"An unexpected error occurred: {str(e)}")
+        logger.error(e)
         sys.exit(1)
     finally:
         # Only attempt to log out if authentication for DELETE requests was successful
