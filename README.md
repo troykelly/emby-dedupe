@@ -1,3 +1,9 @@
+# Deprecated
+
+I simply don't have the time to keep this up to date, but good news @Barlog951 has created https://github.com/Barlog951/emby-curator
+
+Discussion is here https://emby.media/community/topic/150615-emby-curator-%E2%80%93-safe-duplicate-cleanup-metadata-localization-and-library-audits-docker-python-cli/
+
 # Emby Deduplication Script Docker Container
 
 The Emby Deduplication Script Docker container assists in managing media libraries on Emby servers by identifying potential duplicate items. It compares media items within your Emby library and generates a report detailing duplicates that may warrant removal.
